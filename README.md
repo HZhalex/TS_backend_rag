@@ -1,98 +1,168 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Scientific Literature RAG - Backend Service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+[![NestJS](https://img.shields.io/badge/NestJS-11.0-E0234E?style=flat&logo=nestjs&logoColor=white)](https://nestjs.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![LanceDB](https://img.shields.io/badge/LanceDB-0.40-black?style=flat)](https://lancedb.com/)
+[![Node.js](https://img.shields.io/badge/Node.js-22+-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Production-grade Retrieval-Augmented Generation (RAG) backend engine built with **NestJS**, **TypeScript**, and **LanceDB**, engineered to perform semantic search, authority-boosted re-ranking, and grounded generation across 13,000+ scientific research papers.
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## 🚀 Key Features
 
-## Project setup
+- **Asymmetric Vector Embedding**: Utilizes `nomic-ai/nomic-embed-text-v1.5` via `@xenova/transformers` with mandatory `search_query:` prefix processing for 768-D dense representations.
+- **High-Performance Vector Retrieval**: Integrates `@lancedb/lancedb` to query over 164,800+ embedded chunks with Cosine similarity.
+- **Data Mining & Graph Re-ranking**:
+  - **PageRank Authority Boosting**: Leverages co-authorship & citation graph analysis (`graph_coauthorship.json`) to adjust chunk relevance scores dynamically.
+  - **FP-Growth Query Expansion**: Extracts frequent co-occurring research topics (`association_rules.json`) to broaden retrieval recall.
+- **Local LLM Inference**: Powered by `node-llama-cpp` running `Qwen2.5-7B-Instruct-Q4_K_M.gguf` with Metal / CUDA hardware acceleration.
+- **Academic Grounding Engine**: Enforces strict grounding rules, eliminating hallucinations and ensuring accurate inline citations (`[Paper: {paper_id}]`).
 
-```bash
-$ npm install
+---
+
+## 🏛️ System Architecture
+
+```mermaid
+flowchart LR
+    UserQuery["User Query\n(POST /api/rag/chat)"] --> EmbedService["Embedding Service\n(Nomic v1.5 768-D)"]
+    EmbedService --> VectorStore["Vector Store\n(LanceDB 164k+ Chunks)"]
+    VectorStore --> CandidateChunks["Candidate Chunks"]
+    
+    CandidateChunks --> MiningEngine{"Mining Engine"}
+    MiningGraph[("PageRank Graph\n(Co-authorship)")] --> MiningEngine
+    MiningRules[("FP-Growth Rules\n(Topic Expansion)")] --> MiningEngine
+    
+    MiningEngine --> RerankedChunks["Re-ranked Top-K Chunks"]
+    RerankedChunks --> GroundingPrompt["Grounding Prompt Builder"]
+    GroundingPrompt --> LLMService["LLM Inference Engine\n(Qwen2.5-7B via node-llama-cpp)"]
+    LLMService --> Response["Grounded Answer + Citations"]
 ```
 
-## Compile and run the project
+---
 
-```bash
-# development
-$ npm run start
+## 📂 Project Structure
 
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+```text
+backend_rag/
+├── src/
+│   ├── app.controller.ts       # Main controller & healthcheck
+│   ├── app.controller.spec.ts  # Controller unit tests
+│   ├── app.module.ts          # Core application module
+│   ├── app.service.ts         # Base service logic
+│   ├── main.ts                # Application bootstrap entry point
+│   ├── types/                 # Type declarations and DTOs
+│   ├── modules/               # Feature modules (retrieval, llm, mining, rag)
+│   └── common/                # Shared utilities, filters, and interceptors
+├── test/                      # E2E test suites
+├── .env.example               # Environment variable templates
+├── nest-cli.json              # NestJS CLI configuration
+├── package.json               # Dependencies and scripts
+└── tsconfig.json              # TypeScript configuration
 ```
 
-## Run tests
+---
+
+## ⚙️ Prerequisites & Environment Setup
+
+### 1. Requirements
+- **Node.js**: v20+ (v22 LTS recommended)
+- **C++ Build Tools**: Required by `node-llama-cpp`
+  - macOS: Xcode Command Line Tools (`xcode-select --install`)
+  - Linux: `build-essential`, `cmake`
+  - Windows: Visual Studio Build Tools with C++ desktop development
+
+### 2. Configure Environment Variables
+Copy `.env_example` to `.env` and adjust the paths:
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+cp .env_example .env
 ```
 
-## Deployment
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `PORT` | `3001` | HTTP server port |
+| `LANCEDB_PATH` | `../data/gold/lancedb` | Path to LanceDB vector table directory |
+| `MINING_PATH` | `../data/gold/mining` | Path to data mining artifacts (`graph_coauthorship.json`, etc.) |
+| `MODEL_PATH` | `../model/qwen2.5-7b-instruct-q4_k_m.gguf` | Path to local GGUF model file |
+| `GPU_LAYERS` | `99` | Number of model layers offloaded to GPU (Metal/CUDA) |
+| `CONTEXT_SIZE` | `4096` | Context window size for LLM inference |
+| `DEFAULT_TOP_K` | `5` | Default number of chunks retrieved per query |
+| `USE_AUTHORITY_BOOST` | `true` | Enable PageRank authority score re-ranking |
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+---
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## 🛠️ Installation & Execution
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+# 1. Install dependencies
+npm install
+
+# 2. Run in development watch mode
+npm run start:dev
+
+# 3. Build for production
+npm run build
+
+# 4. Run in production mode
+npm run start:prod
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+---
 
-## Resources
+## 🧪 Testing
 
-Check out a few resources that may come in handy when working with NestJS:
+```bash
+# Run unit tests
+npm run test
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+# Run tests in watch mode
+npm run test:watch
 
-## Support
+# Generate code coverage report
+npm run test:cov
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+# Run End-to-End (E2E) tests
+npm run test:e2e
+```
 
-## Stay in touch
+---
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+## 📡 API Reference
 
-## License
+### Health Check
+- **Endpoint**: `GET /`
+- **Response**: `Hello World!`
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### RAG Chat / Generation
+- **Endpoint**: `POST /api/rag/chat`
+- **Request Body**:
+```json
+{
+  "query": "What are the latest techniques in diffusion models for video generation?",
+  "top_k": 5,
+  "use_mining_boost": true
+}
+```
+- **Response**:
+```json
+{
+  "answer": "Recent techniques in video diffusion models focus on spatio-temporal attention...",
+  "citations": [
+    {
+      "paper_id": "arxiv:2401.xxxxx",
+      "title": "Spatio-Temporal Diffusion for High-Fidelity Video",
+      "authors": ["Author A", "Author B"],
+      "section": "method",
+      "similarity_score": 0.884,
+      "authority_boost": 0.052
+    }
+  ],
+  "metrics": {
+    "embedding_ms": 42,
+    "retrieval_ms": 15,
+    "generation_ms": 1120,
+    "total_ms": 1177
+  }
+}
+```

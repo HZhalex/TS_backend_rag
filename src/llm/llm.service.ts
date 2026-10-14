@@ -105,9 +105,10 @@ export class LlmService implements OnModuleInit {
       return 'The provided literature does not contain sufficient details regarding this query (Model in fallback mode).';
     }
 
+    const sequence = this.context.getSequence();
     try {
       const session = new this.chatSessionClass({
-        contextSequence: this.context.getSequence(),
+        contextSequence: sequence,
         systemPrompt,
       });
 
@@ -122,6 +123,10 @@ export class LlmService implements OnModuleInit {
     } catch (error) {
       this.logger.error(`Error during LLM inference: ${(error as Error).message}`);
       throw error;
+    } finally {
+      if (sequence && typeof sequence.dispose === 'function') {
+        sequence.dispose();
+      }
     }
   }
 

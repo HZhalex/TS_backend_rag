@@ -2,6 +2,7 @@ import { Injectable, OnModuleInit, Logger, BadRequestException } from '@nestjs/c
 import { ConfigService } from '@nestjs/config';
 import * as lancedb from '@lancedb/lancedb';
 import * as path from 'path';
+import * as fs from 'fs';
 import { ScientificChunk } from '../types/scientific-rag';
 
 @Injectable()
@@ -23,17 +24,42 @@ export class VectorStoreService implements OnModuleInit {
   }
 
   private async initLanceDb(): Promise<void> {
-    const lancedbUri =
-      this.configService.get<string>('LANCEDB_URI') ||
-      this.configService.get<string>('LANCEDB_PATH') ||
-      '../data/gold/lancedb';
-
     const tableName =
       this.configService.get<string>('LANCEDB_TABLE') || 'scientific_papers_gold';
 
-    this.logger.log(`Connecting to LanceDB at: ${lancedbUri}, table: ${tableName}`);
+    const localCandidates = [
+      path.resolve(process.cwd(), '../data/gold/lancedb'),
+      path.resolve(process.cwd(), 'data/gold/lancedb'),
+      'C:\\document\\Study documents\\Uth-Data-Mining\\data\\gold\\lancedb',
+    ];
 
-    if (lancedbUri.startsWith('s3://')) {
+    let targetUri: string | null = null;
+    let isS3 = false;
+
+    // Check for local optimized table first unless FORCE_REMOTE_LANCEDB is explicitly set
+    if (this.configService.get<string>('FORCE_REMOTE_LANCEDB') !== 'true') {
+      for (const candidate of localCandidates) {
+        if (
+          fs.existsSync(path.join(candidate, `${tableName}.lance`)) ||
+          fs.existsSync(path.join(candidate, tableName))
+        ) {
+          targetUri = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!targetUri) {
+      targetUri =
+        this.configService.get<string>('LANCEDB_URI') ||
+        this.configService.get<string>('LANCEDB_PATH') ||
+        '../data/gold/lancedb';
+      isS3 = targetUri.startsWith('s3://');
+    }
+
+    this.logger.log(`Connecting to LanceDB at: ${targetUri}, table: ${tableName}`);
+
+    if (isS3) {
       const awsEndpoint = this.configService.get<string>('R2_ENDPOINT_URL');
       const awsAccessKeyId = this.configService.get<string>('R2_ACCESS_KEY_ID');
       const awsSecretAccessKey = this.configService.get<string>('R2_SECRET_ACCESS_KEY');
@@ -47,16 +73,17 @@ export class VectorStoreService implements OnModuleInit {
         virtualHostedStyleRequest: 'false',
       };
 
-      this.db = await lancedb.connect(lancedbUri, { storageOptions });
+      this.db = await lancedb.connect(targetUri, { storageOptions });
     } else {
-      const resolvedPath = path.isAbsolute(lancedbUri)
-        ? lancedbUri
-        : path.resolve(process.cwd(), lancedbUri);
+      const resolvedPath = path.isAbsolute(targetUri)
+        ? targetUri
+        : path.resolve(process.cwd(), targetUri);
       this.db = await lancedb.connect(resolvedPath);
     }
 
     this.table = await this.db.openTable(tableName);
-    this.logger.log(`Successfully connected to LanceDB table: ${tableName}`);
+    const count = await this.table.countRows();
+    this.logger.log(`Successfully connected to LanceDB table: ${tableName} (${count} vectors)`);
   }
 
   /**
@@ -101,6 +128,7 @@ export class VectorStoreService implements OnModuleInit {
       'text',
       'context_text',
       'word_count',
+      '_distance',
     ]);
 
     const results = await builder.toArray();

@@ -1,7 +1,8 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, OnModuleInit, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
+import { StorageService } from '../storage/storage.service';
 import {
   AssociationRule,
   GroundedChunkResult,
@@ -15,7 +16,10 @@ export class MiningService implements OnModuleInit {
   private maxPageRank: number = 0.012632;
   private rules: AssociationRule[] = [];
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional() private readonly storageService?: StorageService,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     await this.loadMiningArtifacts();
@@ -52,6 +56,23 @@ export class MiningService implements OnModuleInit {
         } catch (e) {
           this.logger.warn(`Failed to parse local file ${filePath}: ${(e as Error).message}`);
         }
+      }
+    }
+
+    if (!loaded && this.storageService) {
+      try {
+        const content = await this.storageService.getJson('gold/mining/graph_coauthorship.json');
+        if (content) {
+          this.parseInfluencers(content);
+          this.logger.log(
+            `Successfully loaded PageRank graph from Storage (${this.storageService.getProvider()})`,
+          );
+          loaded = true;
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Failed to fetch PageRank graph from Storage: ${(err as Error).message}`,
+        );
       }
     }
 
@@ -116,6 +137,23 @@ export class MiningService implements OnModuleInit {
         } catch (e) {
           this.logger.warn(`Failed to parse rules from ${filePath}: ${(e as Error).message}`);
         }
+      }
+    }
+
+    if (!loaded && this.storageService) {
+      try {
+        const content = await this.storageService.getJson('gold/mining/association_rules.json');
+        if (content) {
+          this.rules = content.rules || content.association_rules || [];
+          this.logger.log(
+            `Successfully loaded ${this.rules.length} rules from Storage (${this.storageService.getProvider()})`,
+          );
+          loaded = true;
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Failed to fetch association rules from Storage: ${(err as Error).message}`,
+        );
       }
     }
 

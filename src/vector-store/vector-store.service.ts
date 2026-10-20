@@ -1,6 +1,7 @@
 import { Injectable, OnModuleInit, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as lancedb from '@lancedb/lancedb';
+import { QdrantClient } from '@qdrant/js-client-rest';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ScientificChunk } from '../types/scientific-rag';
@@ -8,17 +9,63 @@ import { ScientificChunk } from '../types/scientific-rag';
 @Injectable()
 export class VectorStoreService implements OnModuleInit {
   private readonly logger = new Logger(VectorStoreService.name);
+  private retrievalMode: 'qdrant' | 'lancedb' = 'qdrant';
+
+  // LanceDB
   private db: lancedb.Connection | null = null;
   private table: lancedb.Table | null = null;
+
+  // Qdrant
+  private qdrantClient: QdrantClient | null = null;
+  private qdrantCollection: string = 'scientific_papers_gold';
 
   constructor(private readonly configService: ConfigService) {}
 
   async onModuleInit(): Promise<void> {
-    try {
-      await this.initLanceDb();
-    } catch (error) {
-      this.logger.warn(
-        `Failed to initialize LanceDB during startup: ${(error as Error).message}. Will retry on search.`,
+    this.retrievalMode =
+      (this.configService.get<string>('RETRIEVAL_MODE')?.toLowerCase() as
+        | 'qdrant'
+        | 'lancedb') || 'qdrant';
+
+    this.logger.log(`Active Vector Store retrieval mode: ${this.retrievalMode.toUpperCase()}`);
+
+    if (this.retrievalMode === 'qdrant') {
+      try {
+        await this.initQdrant();
+      } catch (error) {
+        this.logger.warn(
+          `Failed to initialize Qdrant during startup: ${(error as Error).message}. Will retry on search.`,
+        );
+      }
+    } else {
+      try {
+        await this.initLanceDb();
+      } catch (error) {
+        this.logger.warn(
+          `Failed to initialize LanceDB during startup: ${(error as Error).message}. Will retry on search.`,
+        );
+      }
+    }
+  }
+
+  private async initQdrant(): Promise<void> {
+    const qdrantUrl =
+      this.configService.get<string>('QDRANT_URL') || 'http://localhost:6333';
+    this.qdrantCollection =
+      this.configService.get<string>('QDRANT_COLLECTION') || 'scientific_papers_gold';
+
+    this.logger.log(`Connecting to Qdrant at: ${qdrantUrl}, collection: ${this.qdrantCollection}`);
+    this.qdrantClient = new QdrantClient({ url: qdrantUrl });
+
+    // Verify collection exists
+    const collections = await this.qdrantClient.getCollections();
+    const found = collections.collections.some((c) => c.name === this.qdrantCollection);
+    if (!found) {
+      this.logger.warn(`Collection "${this.qdrantCollection}" not found in Qdrant yet.`);
+    } else {
+      const info = await this.qdrantClient.getCollection(this.qdrantCollection);
+      this.logger.log(
+        `Successfully connected to Qdrant collection: ${this.qdrantCollection} (${info.points_count ?? 0} vectors)`,
       );
     }
   }
@@ -36,7 +83,6 @@ export class VectorStoreService implements OnModuleInit {
     let targetUri: string | null = null;
     let isS3 = false;
 
-    // Check for local optimized table first unless FORCE_REMOTE_LANCEDB is explicitly set
     if (this.configService.get<string>('FORCE_REMOTE_LANCEDB') !== 'true') {
       for (const candidate of localCandidates) {
         if (
@@ -87,7 +133,8 @@ export class VectorStoreService implements OnModuleInit {
   }
 
   /**
-   * Search for top-K similar chunks using Cosine metric and projection of required columns.
+   * Search for top-K similar chunks using Cosine metric.
+   * Delegates to Qdrant or LanceDB depending on RETRIEVAL_MODE.
    */
   async search(
     queryVector: number[],
@@ -98,6 +145,76 @@ export class VectorStoreService implements OnModuleInit {
       throw new BadRequestException('Query vector must be an array of exactly 768 dimensions');
     }
 
+    if (this.retrievalMode === 'qdrant') {
+      return this.searchQdrant(queryVector, topK, category);
+    }
+
+    return this.searchLanceDb(queryVector, topK, category);
+  }
+
+  private async searchQdrant(
+    queryVector: number[],
+    topK: number,
+    category?: string,
+  ): Promise<ScientificChunk[]> {
+    if (!this.qdrantClient) {
+      await this.initQdrant();
+    }
+    if (!this.qdrantClient) {
+      throw new Error('Qdrant client is not available.');
+    }
+
+    const candidateLimit = Math.max(topK * 3, 20);
+
+    const filter =
+      category && category.trim() !== ''
+        ? {
+            must: [
+              {
+                key: 'primary_category',
+                match: { value: category.trim() },
+              },
+            ],
+          }
+        : undefined;
+
+    const response = await this.qdrantClient.query(this.qdrantCollection, {
+      query: queryVector,
+      limit: candidateLimit,
+      filter,
+      with_payload: true,
+    });
+
+    const points = response.points || [];
+
+    return points.map((point) => {
+      const payload = (point.payload || {}) as Record<string, any>;
+      // In Qdrant, Cosine similarity is in [-1, 1], where 1 is identical.
+      // LanceDB _distance is Cosine Distance (1 - Cosine Similarity).
+      const score = point.score ?? 0;
+      const distance = Math.max(0, 1 - score);
+
+      return {
+        chunk_id: payload.chunk_id || String(point.id),
+        paper_id: payload.paper_id || '',
+        title: payload.title || '',
+        authors: Array.isArray(payload.authors) ? payload.authors : [],
+        primary_category: payload.primary_category || '',
+        section_title: payload.section_title || '',
+        section_type: payload.section_type || '',
+        text: payload.text || '',
+        context_text: payload.context_text || '',
+        word_count: Number(payload.word_count || 0),
+        _distance: distance,
+      } as ScientificChunk;
+    });
+  }
+
+  private async searchLanceDb(
+    queryVector: number[],
+    topK: number,
+    category?: string,
+  ): Promise<ScientificChunk[]> {
     if (!this.table) {
       this.logger.log('LanceDB table not initialized yet. Attempting connection now...');
       await this.initLanceDb();
@@ -136,6 +253,13 @@ export class VectorStoreService implements OnModuleInit {
   }
 
   isReady(): boolean {
+    if (this.retrievalMode === 'qdrant') {
+      return this.qdrantClient !== null;
+    }
     return this.table !== null;
+  }
+
+  getRetrievalMode(): 'qdrant' | 'lancedb' {
+    return this.retrievalMode;
   }
 }

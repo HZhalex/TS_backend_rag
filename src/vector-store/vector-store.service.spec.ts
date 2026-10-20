@@ -41,6 +41,7 @@ describe('VectorStoreService', () => {
           provide: ConfigService,
           useValue: {
             get: jest.fn((key: string) => {
+              if (key === 'RETRIEVAL_MODE') return 'lancedb';
               if (key === 'LANCEDB_URI') return 'data/gold/lancedb';
               if (key === 'LANCEDB_TABLE') return 'scientific_papers_gold';
               return null;
@@ -52,6 +53,7 @@ describe('VectorStoreService', () => {
 
     service = module.get<VectorStoreService>(VectorStoreService);
     (service as any).table = mockTable;
+    (service as any).retrievalMode = 'lancedb';
   });
 
   it('should be defined', () => {
@@ -62,7 +64,7 @@ describe('VectorStoreService', () => {
     await expect(service.search([0.1, 0.2])).rejects.toThrow(BadRequestException);
   });
 
-  it('should perform vector search and return chunks', async () => {
+  it('should perform vector search in LanceDB and return chunks', async () => {
     const queryVector = new Array(768).fill(0.05);
     const results = await service.search(queryVector, 5, 'cs.AI');
 
@@ -71,5 +73,51 @@ describe('VectorStoreService', () => {
     expect(mockQueryBuilder.where).toHaveBeenCalledWith("primary_category = 'cs.AI'");
     expect(results).toHaveLength(1);
     expect(results[0].chunk_id).toBe('paper_1_chunk_0');
+  });
+
+  describe('Qdrant Search', () => {
+    it('should perform vector search via Qdrant and return mapped chunks', async () => {
+      (service as any).retrievalMode = 'qdrant';
+      const mockQdrantClient = {
+        query: jest.fn().mockResolvedValue({
+          points: [
+            {
+              id: 'uuid-1',
+              score: 0.88,
+              payload: {
+                chunk_id: 'paper_1_chunk_0',
+                paper_id: '2401.0001',
+                title: 'Deep Learning Review',
+                authors: ['Alice Doe', 'Bob Smith'],
+                primary_category: 'cs.AI',
+                section_title: 'Introduction',
+                section_type: 'introduction',
+                text: 'This paper reviews recent advances in deep learning.',
+                context_text:
+                  'Paper: "Deep Learning Review" | Section: Introduction\n\nThis paper reviews...',
+                word_count: 50,
+              },
+            },
+          ],
+        }),
+      };
+      (service as any).qdrantClient = mockQdrantClient;
+
+      const queryVector = new Array(768).fill(0.05);
+      const results = await service.search(queryVector, 5, 'cs.AI');
+
+      expect(mockQdrantClient.query).toHaveBeenCalledWith('scientific_papers_gold', {
+        query: queryVector,
+        limit: 20,
+        filter: {
+          must: [{ key: 'primary_category', match: { value: 'cs.AI' } }],
+        },
+        with_payload: true,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0].chunk_id).toBe('paper_1_chunk_0');
+      expect(results[0]._distance).toBeCloseTo(0.12);
+    });
   });
 });

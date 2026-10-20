@@ -1,0 +1,74 @@
+# RAG_TS backend: app + MongoDB (single-node replica set, for transactions).
+#
+# Qdrant: by default the app reads the UTH pipeline's Qdrant on the host
+# (RAGTS_QDRANT_URL, default http://host.docker.internal:6333). RAGTS_* names avoid clashing
+# with the developer's .env, which compose reads automatically. `--profile standalone` also starts an empty
+# Qdrant for running without the pipeline (seed a `_test` collection with scripts/seed-qdrant.ts).
+#
+#   JWT_ACCESS_SECRET=... JWT_REFRESH_SECRET=... QDRANT_API_KEY=... docker compose up --build
+#
+# Volumes: ../model (GGUF), ../data (world + mining files exported by the pipeline).
+
+services:
+  mongo:
+    image: mongo:7
+    command: ['--replSet', 'rs0', '--bind_ip_all']
+    # Host port for running the app outside Docker (27017 is often taken):
+    # MONGO_URI=mongodb://localhost:27018/rag_ts?replicaSet=rs0&directConnection=true
+    ports:
+      - '${RAGTS_MONGO_PORT:-27018}:27017'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Initiates the replica set on first start, then just reports it.
+      test:
+        [
+          'CMD',
+          'mongosh',
+          '--quiet',
+          '--eval',
+          "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    profiles: ['standalone']
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  app:
+    build: .
+    ports:
+      - '${RAGTS_PORT:-3000}:3000'
+    environment:
+      MONGO_URI: mongodb://mongo:27017/rag_ts?replicaSet=rs0
+      QDRANT_URL: ${RAGTS_QDRANT_URL:-http://host.docker.internal:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${RAGTS_QDRANT_COLLECTION:-scientific_papers_gold}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET (>= 32 chars)}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET (>= 32 chars)}
+      EMBEDDING_MODEL: ${RAGTS_EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      MODEL_PATH: /models/${RAGTS_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m.gguf}
+      LLM_GPU: ${LLM_GPU:-auto}
+      LLM_MAX_QUEUE: ${LLM_MAX_QUEUE:-8}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-120000}
+      WORLD_DATA_DIR: /data/world
+      MINING_DIR: /data/gold/mining
+      CORS_ORIGINS: ${RAGTS_CORS_ORIGINS:-http://localhost:5174}
+    volumes:
+      - ../model:/models:ro
+      - ../data:/data:ro
+      - hf-cache:/app/node_modules/@huggingface/transformers/.cache
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  qdrant-data:
+  hf-cache:

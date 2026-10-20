@@ -1,0 +1,74 @@
+# ASSUMPTIONS — backend RAG_TS
+
+Định dạng: `[B<số>] <giả định> — <lý do>`.
+
+- [B1] Làm trên nhánh `feat/monolith-v1` của `backend_rag`; code cũ (LanceDB, RabbitMQ, R2) giữ ở commit `b1492df` trên `refactor-and-check` — người dùng chọn viết lại, không mất WIP.
+- [B1] Dùng Node 26 có sẵn trên máy (prompt ghi Node 22) — API dùng đều có trên cả hai bản.
+- [B1] `uuidv7()` tự viết trong `src/common/uuid.ts` thay cho package `uuid` — `uuid` bản mới chỉ có ESM, không chạy được với Jest CommonJS.
+- [B1] Bỏ `@nestjs/config`; env đọc bằng `dotenv` + zod trong `AppConfigService` — prompt yêu cầu zod, không cần thêm lớp ConfigService.
+- [B1] Thêm biến `LLM_CONCURRENCY` (mặc định 1) — B6 yêu cầu "tối đa 1 lượt sinh cùng lúc (cấu hình được)".
+- [B1] `LLM_GPU` nhận `auto | cuda | metal | vulkan | false` — đúng các giá trị `getLlama({ gpu })` của node-llama-cpp.
+- [B1] Log nghiệp vụ (`LOGIN_OK`, …) là `msg` của chính dòng log request, gán qua `logEvent()` (AsyncLocalStorage); request không gán thì `msg` là `REQUEST_DONE` / `REQUEST_FAILED` — §1.3 yêu cầu đúng 1 dòng mỗi request.
+- [B1] `path` trong log bỏ query string — tránh ghi `q` tìm kiếm của người dùng.
+- [B1] Route không tồn tại trả message mặc định của Nest `Cannot GET /api/v1/...` — API_DESIGN không quy định message 404 route.
+- [B1] Swagger ở `/api/v1/docs`, JSON ở `/api/v1/docs-json` — B11 yêu cầu `/api/v1/docs`; dựng sẵn từ B1.
+- [B1] Ở `NODE_ENV=test` log bị tắt (`silent`) — test không in log ra console.
+- [B2] `@nestjs/jwt` 11, `@nestjs/mongoose` 11, `mongoose` 8 (không phải bản mới nhất) — `@nestjs/jwt`/`@nestjs/mongoose` 12 chỉ có ESM (dành cho Nest 12); driver `mongodb` 7 của mongoose 9 lỗi "Missing required sub-document 'driver'" khi chạy trong Jest.
+- [B2] `token_hash` = HMAC-SHA256(`JWT_REFRESH_SECRET`, token) thay vì SHA-256 trần — vẫn là băm một chiều như đặc tả, thêm khoá để DB lộ cũng không dò ngược được; đồng thời dùng tới biến `JWT_REFRESH_SECRET` mà B1 bắt buộc.
+- [B2] Hai request refresh đồng thời cùng token: request thua nhận 401 nhưng KHÔNG thu hồi cả họ token — chỉ token đã thu hồi từ trước bị dùng lại mới tính là `REFRESH_REUSED`.
+- [B2] `display_name` bắt buộc khi đăng ký (1–60 ký tự, message `invalid display_name`) — API_DESIGN §2 có field này trong RegisterReq, không ghi là optional.
+- [B2] Password tối đa 200 ký tự (`password too long`) — chặn payload lớn làm chậm argon2; API_DESIGN không quy định.
+- [B2] Đếm đăng nhập sai theo `sha256(email|ip)` trong collection `login_attempts` có TTL 15 phút; đăng nhập đúng xoá bộ đếm; lần bị chặn 429 cũng log `LOGIN_FAILED` (`reason: rate_limited`).
+- [B2] `JwtAuthGuard` không tra DB mỗi request (JWT stateless, sống 15 phút) — user bị xoá vẫn dùng được access token tới khi hết hạn; `/auth/me` trả 401 nếu user không còn.
+- [B2] Header `Authorization` sai dạng (không phải `Bearer <token>`) ➔ 401 `unauthorized`, kể cả ở OptionalJwtAuthGuard.
+- [B2] Lint tắt `no-unsafe-member-access/assignment/argument` riêng cho file test — body của supertest không có kiểu; code chính vẫn cấm `any`.
+- [B3] Model ONNX dùng: `nomic-ai/nomic-embed-text-v1.5` file `onnx/model.onnx` (`dtype: 'fp32'`) qua `@huggingface/transformers` 4.3.1 — kiểm chứng: cùng câu hỏi, cosine với `NomicEmbedder.embed_query` (Python của pipeline) = 0.99999999999, sai lệch tối đa 2e-7. Bản lượng tử hoá (q8) nhẹ hơn nhưng lệch vector tài liệu pipeline đã embed fp32.
+- [B3] `EMBEDDING_MODEL` là thư mục có thật ➔ nạp offline từ thư mục đó; không thì coi là id trên Hugging Face Hub (lần đầu tải ~550 MB, mất vài phút, sau đó dùng cache).
+- [B3] `EmbeddingPort.embedQuery` trả `number[]` đúng interface của prompt; `embed_ms` do RagService tự đo quanh lời gọi — giữ interface gọn, cache hit thì `embed_ms` ≈ 0 là đúng thực tế.
+- [B3] Model nạp nền lúc khởi động (không chặn app); request tới trước khi nạp xong thì chờ cùng promise; nạp lỗi ➔ 503 `embedding unavailable`, request sau thử nạp lại.
+- [B3] Chuẩn hoá query = trim + gộp khoảng trắng, dùng cho cả khoá cache lẫn text đem embed.
+- [B4] Dùng `client.query()` (API tìm kiếm mới của Qdrant ≥ 1.10) thay vì `search()` đã deprecated; Qdrant có sẵn chạy ở `localhost:6333` (docker của pipeline), cần `QDRANT_API_KEY`.
+- [B4] Mọi lời gọi Qdrant có hạn 3 s (client `timeout` + `Promise.race`), lỗi bất kỳ ➔ 503 `qdrant unavailable`. Đo thật: lần đầu (cache lạnh, 819.673 point) 1,86 s, các lần sau 21–104 ms.
+- [B4] `score` là cosine Qdrant trả về, không kẹp về [0, 1] — đặc tả ghi "0–1" nhưng cosine có thể âm; với vector đã chuẩn hoá thực tế luôn dương.
+- [B4] Payload hiện CHƯA có `twig_id`, `chunk_index` (Phụ lục B P2, P3) — lọc twig tự tắt (log `QDRANT_NO_TWIG_ID` một lần lúc khởi động); `toChunkPayload` giữ 2 field này nếu sau này pipeline thêm.
+- [B4] `section_type` giữ nguyên giá trị thô của pipeline trong `ChunkPayload` (vd. `related_work`, `conclusion`); chỉ map về 6 loại của FE ở tầng API (`toSectionType`).
+- [B5] File mining lấy từ MinIO của pipeline (`gold/mining/graph_coauthorship.json`, `association_rules.json`) về `RAG_TS/data/gold/mining/` (= `MINING_DIR` mặc định). `RAG_TS/data` là symlink sang `data/` (đã gitignore) của repo pipeline.
+- [B5] PageRank tác giả gộp từ `top_influencers` (40) và `graph_export.nodes` (120) — file thật chỉ xuất 120 tác giả của 142.764; tác giả ngoài danh sách có authority = 0. Chuẩn hoá theo `max` của danh sách đã gộp.
+- [B5] Item của luật FP-Growth có tiền tố: `tag:` (chủ đề) được dùng như cụm từ (`tag:large-language-models` ➔ "large language models"); `cat:` (mã category) không phải chữ ➔ luật có antecedent `cat:` bị bỏ, consequent `cat:` bị lọc. Thực tế còn 7/41 luật dùng được.
+- [B5] Luật xếp theo confidence × lift giảm dần để chọn tối đa 5 từ mở rộng ổn định. Một số tag pipeline bị cắt (`attention-mech`, `retrieval-augmented-gen`) nên khó khớp câu hỏi tự nhiên — để pipeline đặt tên tag đầy đủ (bổ sung Phụ lục B).
+- [B5] KHÔNG có `prompt_fe_3d.md` trong repo — định dạng world lấy theo type FE (`frontend_rag/src/types/world.ts`): `tree.json` = `{ world_version, nodes: TreeNode[] }`; `centroids_l1.json` / `centroids_l2.json` = `{ items: [{ node_id, vector: number[768] }] }`; `categories.json` = `Category[]`. Cũng chấp nhận mảng trần. Pipeline cần xuất đúng định dạng này (Phụ lục B P1).
+- [B5] Twig ở tầng 2 = node `depth: 2` có `parent_id` thuộc các cành đã chọn VÀ có centroid trong `centroids_l2.json`.
+- [B5] `categoryIndex` không thấy mã ➔ index của mục `code: "other"`; không có mục "other" ➔ `-1`.
+- [B5] Hoà điểm khi chọn top-n: ưu tiên `node_id` nhỏ hơn — kết quả route ổn định giữa các lần chạy.
+- [B6] `LlmService` tách 3 lớp: `LlmQueue` (logic thuần), `LlmEngine` (interface; `NodeLlamaEngine` dùng node-llama-cpp 3.22) và `TokenChannel` (callback ➔ async iterator) — test dùng engine giả, không cần model.
+- [B6] node-llama-cpp chỉ có ESM ➔ nạp bằng `new Function('return import(...)')` để TS không đổi thành `require`.
+- [B6] Một context, `sequences = LLM_CONCURRENCY`; mỗi lượt lấy sequence riêng + `LlamaChatSession` mới (lịch sử rỗng), dispose sequence trong `finally`. `contextSize` 8192 — đủ cho 20 chunk × ~450 từ + câu trả lời 1024 token.
+- [B6] `queue_length` trong status = số lượt đang sinh + đang chờ (để thấy tải thật); hàng chờ tối đa `LLM_MAX_QUEUE` không tính lượt đang chạy. Kiểm chứng thật: 10 request, `LLM_MAX_QUEUE=8` ➔ 1 chạy, 8 chờ, 1 nhận 429.
+- [B6] Timeout `LLM_TIMEOUT_MS` tính từ lúc lấy được slot (bắt đầu sinh), không tính thời gian chờ hàng — đúng "tính từ lúc bắt đầu sinh" của đặc tả.
+- [B6] Lỗi engine giữa chừng (không phải timeout/abort) ➔ 503 `llm unavailable` + log `LLM_GENERATION_FAILED`.
+- [B6] Model nạp nền lúc khởi động; trước khi xong mọi lượt ➔ 503 `llm unavailable`. Đo trên Mac (Metal): nạp 4,6 s, câu ngắn đầu tiên TTFT ~4 s.
+- [B7] Phiên chat được kiểm quyền ĐẦU luồng (404 trước khi stream) nhưng chỉ TẠO và ghi tin nhắn KHI XONG, trong 1 transaction — request lỗi/huỷ không để lại phiên rỗng. Vì vậy `SessionStorePort` gồm `assertOwned` + `saveExchange` (gộp `createFromQuery` + `appendExchange` của prompt).
+- [B7] Stream: lỗi xảy ra trước event ĐẦU TIÊN (vd. session 404) ➔ HTTP status + body §1.2; sau đó (embedding/Qdrant/LLM lỗi) ➔ event `error` `{ message, status }` rồi đóng. `phase: embedding` được gửi trước khi embed nên lỗi embed/Qdrant đi qua event `error`.
+- [B7] Phát hiện client đóng bằng `res.on('close')` + `!res.writableFinished` (thay cho `req.on('close')` của prompt) — từ Node 16, `req` phát `close` ngay khi đọc xong body. Listener được `prependListener` để chạy trước pino-http, dòng log request ghi đúng `CHAT_STREAM_ABORTED` / `CHAT_ABORTED` (mức info).
+- [B7] `POST /rag/chat` bị client huỷ ➔ status 499 (chỉ để log, client không nhận) — không có trong API_DESIGN vì client đã đi.
+- [B7] Lượt sinh bị huỷ khi node-llama-cpp còn đang đọc prompt thì chỉ dừng khi tới token đầu: đo thật với `top_k` 5 (~3.500 token ngữ cảnh) slot giải phóng ~15 s sau khi huỷ; không lưu gì.
+- [B7] `category` sai ➔ 400 `validation error` (đúng B4); các field khác có message riêng (`top_k must be an integer between 1 and 20`, …). Thứ tự decorator class-validator: kiểm cơ bản (IsNotEmpty/IsString/IsInt) đặt dưới cùng để message của nó được báo trước.
+- [B7] `timings.total_ms` đo từ lúc controller nhận request (sau validate) tới trước event `done`.
+- [B7] Log `CHAT_OK` / `CHAT_STREAM_OK` kèm `query_len`, `top_k`, `chunks`, `unverified_citations`, `timings`; `CHAT_FAILED` kèm `error_status`.
+- [B8] `POST /chat-sessions` không có title ➔ "New chat", và câu hỏi đầu tiên lưu vào phiên đó sẽ thay tiêu đề (cờ `title_is_default`). Phiên tạo từ `/rag/chat` lấy 60 ký tự đầu câu hỏi (gộp khoảng trắng).
+- [B8] Đổi tên phiên cập nhật `updated_at` (phiên nhảy lên đầu danh sách). `DELETE` phiên của người khác ➔ 204 và không xoá gì (không lộ phiên tồn tại).
+- [B8] Cursor = base64url(JSON `{u: updated_at, id}`); không ký HMAC — cursor chỉ là vị trí trong dữ liệu của chính user (lọc `user_id` luôn áp), sửa cursor không lộ dữ liệu người khác.
+- [B8] Transaction bắt buộc replica set (docker compose dùng `rs0` 1 node, test dùng `MongoMemoryReplSet`); không làm nhánh ghi không-transaction.
+- [B9] `paper_id` dài > 200 ký tự ➔ 404 `paper not found` (API_DESIGN §5 chỉ có 200/404/503). Thứ tự chunk: abstract trước, rồi `chunk_index` (nếu mọi chunk có) hoặc `chunk_id` theo thứ tự tự nhiên (`_sec2` < `_sec10`). `has_fulltext` = có chunk không phải abstract.
+- [B9] Dữ liệu thật không có paper_id chứa `:` (có dạng arXiv và `s2_<hash>`); route với `:` (encode hoặc không) được kiểm bằng test.
+- [B10] `world` KHÔNG ảnh hưởng `status` (chỉ mongo/qdrant ➔ down, llm ➔ degraded); thêm `world_version` vào body health (Phụ lục A7). Embedding chưa sẵn sàng không có cờ riêng (API_DESIGN chỉ có mongo/qdrant/llm/world).
+- [B10] Kết quả health là của lần kiểm gần nhất (≤ 10 s) — ngay sau khởi động có thể báo `llm: false` tới lần kiểm kế tiếp. Lần kiểm đầu không log `HEALTH_CHANGED`.
+- [B11] E2E chạy cả app (`AppModule`) với Mongo in-memory; chỉ embedding và engine LLM là giả (LLM giả trích dẫn paper đầu tiên trong ngữ cảnh). Qdrant: in-memory (cùng dữ liệu với `seed-qdrant.ts`) mặc định, hoặc Qdrant thật khi đặt `E2E_QDRANT_URL` (seed collection `rag_ts_e2e_test`). Đã chạy cả hai chế độ — Qdrant thật là container tạm `qdrant/qdrant:v1.15.4` ở cổng 6555, không đụng Qdrant của pipeline.
+- [B11] Test e2e B1 (404 + `X-Request-Id`) gộp vào `test/flow.e2e-spec.ts` — `AppModule` đầy đủ sẽ nạp model thật nếu không thay bằng bản giả.
+- [B11] docker-compose: Qdrant mặc định là Qdrant của pipeline trên host (`host.docker.internal:6333`); service `qdrant` riêng nằm sau profile `standalone` vì cổng 6333 trên máy đã do pipeline dùng. Mongo không map cổng ra host (cổng 27017 trên máy đã có container khác).
+- [B11] Biến của compose dùng tiền tố `RAGTS_` — compose tự đọc `.env` của thư mục (đang chứa cấu hình dev cũ `QDRANT_URL=http://localhost:6333`), trùng tên sẽ trỏ container vào chính nó.
+- [B11] Kiểm chứng `docker compose up`: app `healthy`, `/health` = `degraded` (mongo ✓, qdrant ✓, chưa có model) đúng tiêu chí B11.3. Với model 7B thật, container bị kill (137) do máy ảo Docker chỉ 7,7 GB dùng chung — ghi trong README.
+- [B11] Cập nhật `docs/API_DESIGN.md`: thêm `nprobe` vào ChatReq (§3, Phụ lục A2), `world` + `world_version` vào Health (§6, Phụ lục A5/A7).
+- [FE-live] Chạy thật với FE: Qwen hay chép nguyên tiêu đề ngữ cảnh `[Paper ID: x | Title …]` và viết toán bằng `\(…\)`. Đã đổi tiêu đề ngữ cảnh thành `--- [Paper: id] "Title" — Section: … ---` (đúng tag cần trích), quy tắc 3–4 của system prompt nói rõ định dạng; `extractCitations` chấp nhận thêm `[Paper ID: id | …]`.
+- [FE-live] `CORS_ORIGINS` mặc định `http://localhost:5174` — cổng 5173 là frontend của pipeline UTH, FE RAG_TS chuyển sang 5174.
+- [FE-live] Compose map Mongo ra host cổng 27018 (`RAGTS_MONGO_PORT`) để chạy app ngoài Docker: `MONGO_URI=mongodb://localhost:27018/rag_ts?replicaSet=rs0&directConnection=true`.

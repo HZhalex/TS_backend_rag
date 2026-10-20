@@ -273,3 +273,24 @@ describe('Chat sessions (integration)', () => {
     expect((await svc.get(ALICE, s.id)).messages).toHaveLength(0);
   });
 });
+
+describe('Chat sessions on a standalone MongoDB (no transactions)', () => {
+  it('saveExchange falls back to sequential writes', async () => {
+    const { MongoMemoryServer } = await import('mongodb-memory-server');
+    const standalone = await MongoMemoryServer.create();
+    const t = await createTestApp(standalone as unknown as MongoMemoryReplSet, {
+      imports: [AuthModule, ChatSessionsModule],
+    });
+    try {
+      const svc = t.app.get(ChatSessionsService);
+      const first = await svc.saveExchange(ALICE, null, 'Standalone?', answer);
+      await svc.saveExchange(ALICE, first.session_id, 'Again', answer);
+      const s = await svc.get(ALICE, first.session_id);
+      expect(s.messages).toHaveLength(4);
+      expect((await svc.list(ALICE, 20)).items[0].message_count).toBe(4);
+    } finally {
+      await t.close();
+      await standalone.stop();
+    }
+  });
+});

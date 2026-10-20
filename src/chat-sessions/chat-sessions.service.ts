@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
@@ -97,8 +98,24 @@ function toMessage(m: ChatMessage & { _id: Types.ObjectId }): MessageDto {
   return out;
 }
 
+/** Error of a transaction on a standalone server (IllegalOperation, code 20). */
+export function isTransactionUnsupported(e: unknown): boolean {
+  const err = e as { code?: unknown; message?: unknown };
+  return (
+    err?.code === 20 ||
+    (typeof err?.message === 'string' &&
+      /Transaction numbers are only allowed on a replica set|transactions are not supported/i.test(
+        err.message,
+      ))
+  );
+}
+
 @Injectable()
 export class ChatSessionsService implements SessionStorePort {
+  private readonly logger = new Logger(ChatSessionsService.name);
+  /** Cleared the first time the server refuses a transaction (standalone MongoDB). */
+  private transactions = true;
+
   constructor(
     @InjectModel(ChatSession.name)
     private readonly sessions: Model<ChatSession>,
@@ -206,13 +223,21 @@ export class ChatSessionsService implements SessionStorePort {
     await this.findOwned(sessionId, userId);
   }
 
-  /** One question/answer pair in a single transaction (new session when `sessionId` is null). */
+  /**
+   * One question/answer pair (new session when `sessionId` is null), in a transaction when the
+   * server supports it. A standalone MongoDB (no replica set) cannot: the writes then run in
+   * sequence, messages first, so a failure leaves at worst an orphan message, never a count that
+   * is ahead of the messages.
+   */
   async saveExchange(
     userId: string,
     sessionId: string | null,
     question: string,
     answer: AssistantMessageInput,
   ): Promise<SavedExchange> {
+    if (!this.transactions) {
+      return this.writeExchange(null, userId, sessionId, question, answer);
+    }
     const db = await this.connection.startSession();
     try {
       let saved: SavedExchange | null = null;
@@ -227,13 +252,20 @@ export class ChatSessionsService implements SessionStorePort {
       });
       if (!saved) throw new Error('transaction produced no result');
       return saved;
+    } catch (e) {
+      if (!isTransactionUnsupported(e)) throw e;
+      this.transactions = false;
+      this.logger.warn(
+        'MONGO_NO_TRANSACTIONS: standalone MongoDB, chat writes are not atomic',
+      );
+      return this.writeExchange(null, userId, sessionId, question, answer);
     } finally {
       await db.endSession();
     }
   }
 
   private async writeExchange(
-    db: ClientSession,
+    db: ClientSession | null,
     userId: string,
     sessionId: string | null,
     question: string,
@@ -256,7 +288,7 @@ export class ChatSessionsService implements SessionStorePort {
             title_is_default: false,
           },
         ],
-        { session: db },
+        { session: db ?? undefined },
       );
     }
     const now = Date.now();
@@ -278,7 +310,7 @@ export class ChatSessionsService implements SessionStorePort {
           created_at: new Date(now + 1),
         },
       ],
-      { session: db },
+      { session: db ?? undefined },
     );
     const set: Record<string, unknown> = { updated_at: new Date(now + 1) };
     if (session.title_is_default) {
@@ -288,7 +320,7 @@ export class ChatSessionsService implements SessionStorePort {
     await this.sessions.updateOne(
       { _id: session._id },
       { $inc: { message_count: 2 }, $set: set },
-      { session: db, timestamps: false },
+      { session: db ?? undefined, timestamps: false },
     );
     return {
       session_id: session._id.toString(),

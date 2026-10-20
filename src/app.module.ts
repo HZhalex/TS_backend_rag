@@ -1,22 +1,29 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
+import { MongooseModule } from '@nestjs/mongoose';
+import { AuthModule } from './auth/auth.module';
+import { ChatSessionsModule } from './chat-sessions/chat-sessions.module';
+import { LoggerModule } from './common/logger.module';
+import { AppConfigModule, AppConfigService } from './config/app-config.service';
+import { HealthModule } from './health/health.module';
+import { PapersModule } from './papers/papers.module';
 import { RagModule } from './rag/rag.module';
-import { StorageModule } from './storage/storage.module';
-import { QueueModule } from './queue/queue.module';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-      envFilePath: ['.env', '../.env'],
+    AppConfigModule,
+    LoggerModule,
+    MongooseModule.forRootAsync({
+      inject: [AppConfigService],
+      useFactory: (config: AppConfigService) => ({
+        uri: config.get('MONGO_URI'),
+        serverSelectionTimeoutMS: 5000,
+      }),
     }),
-    StorageModule,
-    QueueModule,
+    AuthModule,
     RagModule,
+    ChatSessionsModule,
+    PapersModule,
+    HealthModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}

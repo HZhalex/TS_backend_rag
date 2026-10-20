@@ -1,168 +1,95 @@
-# Scientific Literature RAG - Backend Service
+# RAG_TS — Backend (Monolith NestJS)
 
-[![NestJS](https://img.shields.io/badge/NestJS-11.0-E0234E?style=flat&logo=nestjs&logoColor=white)](https://nestjs.com/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![LanceDB](https://img.shields.io/badge/LanceDB-0.40-black?style=flat)](https://lancedb.com/)
-[![Node.js](https://img.shields.io/badge/Node.js-22+-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
+Backend hỏi đáp khoa học có trích dẫn: embed câu hỏi (Nomic v1.5) ➔ đi qua cây World 3D ➔ tìm trong Qdrant ➔ rerank theo PageRank tác giả ➔ Qwen2.5-7B trả lời, stream qua SSE cho frontend 3D.
 
-Production-grade Retrieval-Augmented Generation (RAG) backend engine built with **NestJS**, **TypeScript**, and **LanceDB**, engineered to perform semantic search, authority-boosted re-ranking, and grounded generation across 13,000+ scientific research papers.
+- **Hợp đồng API:** [`../docs/API_DESIGN.md`](../docs/API_DESIGN.md) — 18 route dưới `/api/v1`.
+- **Kế hoạch triển khai:** [`../docs/prompt_backend.md`](../docs/prompt_backend.md) (B1–B11, Phụ lục A đồng bộ FE, Phụ lục B yêu cầu pipeline).
+- **Giả định & tiến độ:** [`ASSUMPTIONS.md`](ASSUMPTIONS.md), [`PROGRESS.md`](PROGRESS.md).
+- **Swagger:** `http://localhost:3000/api/v1/docs` (JSON: `/api/v1/docs-json`).
 
----
+## Kiến trúc
 
-## 🚀 Key Features
+| Thành phần | Vai trò | Ghi chú |
+| :-- | :-- | :-- |
+| MongoDB | `users`, `refresh_tokens`, `login_attempts`, `chat_sessions`, `chat_messages` | Replica set (cần cho transaction) |
+| Qdrant `scientific_papers_gold` | Vector + payload chunk | **Chỉ đọc** — pipeline UTH ghi |
+| `MINING_DIR` | `graph_coauthorship.json`, `association_rules.json` | Pipeline xuất (MinIO `gold/mining/`) |
+| `WORLD_DATA_DIR` | `tree.json`, `centroids_l1.json`, `centroids_l2.json`, `categories.json` | Pipeline xuất; thiếu ➔ event `route` có `steps: []` |
+| `MODEL_PATH` | GGUF Qwen2.5-7B Q4_K_M | node-llama-cpp, tự chọn Metal/CUDA/CPU |
 
-- **Asymmetric Vector Embedding**: Utilizes `nomic-ai/nomic-embed-text-v1.5` via `@xenova/transformers` with mandatory `search_query:` prefix processing for 768-D dense representations.
-- **High-Performance Vector Retrieval**: Integrates `@lancedb/lancedb` to query over 164,800+ embedded chunks with Cosine similarity.
-- **Data Mining & Graph Re-ranking**:
-  - **PageRank Authority Boosting**: Leverages co-authorship & citation graph analysis (`graph_coauthorship.json`) to adjust chunk relevance scores dynamically.
-  - **FP-Growth Query Expansion**: Extracts frequent co-occurring research topics (`association_rules.json`) to broaden retrieval recall.
-- **Local LLM Inference**: Powered by `node-llama-cpp` running `Qwen2.5-7B-Instruct-Q4_K_M.gguf` with Metal / CUDA hardware acceleration.
-- **Academic Grounding Engine**: Enforces strict grounding rules, eliminating hallucinations and ensuring accurate inline citations (`[Paper: {paper_id}]`).
+Module: `auth`, `rag` (+ `embedding`, `vector-store`, `mining`, `tree-router`, `llm`), `chat-sessions`, `papers`, `health`; dùng chung ở `common/` (request-id, log JSON 1 dòng/request, body lỗi §1.2, pagination).
 
----
-
-## 🏛️ System Architecture
-
-```mermaid
-flowchart LR
-    UserQuery["User Query\n(POST /api/rag/chat)"] --> EmbedService["Embedding Service\n(Nomic v1.5 768-D)"]
-    EmbedService --> VectorStore["Vector Store\n(LanceDB 164k+ Chunks)"]
-    VectorStore --> CandidateChunks["Candidate Chunks"]
-    
-    CandidateChunks --> MiningEngine{"Mining Engine"}
-    MiningGraph[("PageRank Graph\n(Co-authorship)")] --> MiningEngine
-    MiningRules[("FP-Growth Rules\n(Topic Expansion)")] --> MiningEngine
-    
-    MiningEngine --> RerankedChunks["Re-ranked Top-K Chunks"]
-    RerankedChunks --> GroundingPrompt["Grounding Prompt Builder"]
-    GroundingPrompt --> LLMService["LLM Inference Engine\n(Qwen2.5-7B via node-llama-cpp)"]
-    LLMService --> Response["Grounded Answer + Citations"]
-```
-
----
-
-## 📂 Project Structure
-
-```text
-backend_rag/
-├── src/
-│   ├── app.controller.ts       # Main controller & healthcheck
-│   ├── app.controller.spec.ts  # Controller unit tests
-│   ├── app.module.ts          # Core application module
-│   ├── app.service.ts         # Base service logic
-│   ├── main.ts                # Application bootstrap entry point
-│   ├── types/                 # Type declarations and DTOs
-│   ├── modules/               # Feature modules (retrieval, llm, mining, rag)
-│   └── common/                # Shared utilities, filters, and interceptors
-├── test/                      # E2E test suites
-├── .env.example               # Environment variable templates
-├── nest-cli.json              # NestJS CLI configuration
-├── package.json               # Dependencies and scripts
-└── tsconfig.json              # TypeScript configuration
-```
-
----
-
-## ⚙️ Prerequisites & Environment Setup
-
-### 1. Requirements
-- **Node.js**: v20+ (v22 LTS recommended)
-- **C++ Build Tools**: Required by `node-llama-cpp`
-  - macOS: Xcode Command Line Tools (`xcode-select --install`)
-  - Linux: `build-essential`, `cmake`
-  - Windows: Visual Studio Build Tools with C++ desktop development
-
-### 2. Configure Environment Variables
-Copy `.env_example` to `.env` and adjust the paths:
+## Chạy dev (Mac M-series, Metal)
 
 ```bash
-cp .env_example .env
+cp .env.example .env        # sửa MONGO_URI, QDRANT_URL/QDRANT_API_KEY, JWT_*; giữ MODEL_PATH, *_DIR
+npm ci
+npm run start:dev           # http://localhost:3000/api/v1
 ```
 
-| Variable | Default Value | Description |
-| :--- | :--- | :--- |
-| `PORT` | `3001` | HTTP server port |
-| `LANCEDB_PATH` | `../data/gold/lancedb` | Path to LanceDB vector table directory |
-| `MINING_PATH` | `../data/gold/mining` | Path to data mining artifacts (`graph_coauthorship.json`, etc.) |
-| `MODEL_PATH` | `../model/qwen2.5-7b-instruct-q4_k_m.gguf` | Path to local GGUF model file |
-| `GPU_LAYERS` | `99` | Number of model layers offloaded to GPU (Metal/CUDA) |
-| `CONTEXT_SIZE` | `4096` | Context window size for LLM inference |
-| `DEFAULT_TOP_K` | `5` | Default number of chunks retrieved per query |
-| `USE_AUTHORITY_BOOST` | `true` | Enable PageRank authority score re-ranking |
+- Cần MongoDB replica set: `docker compose up -d mongo` (rồi `MONGO_URI=mongodb://localhost:27017/rag_ts?replicaSet=rs0&directConnection=true` nếu map cổng), hoặc Mongo sẵn có.
+- Qdrant: dùng Qdrant của pipeline (`QDRANT_URL=http://localhost:6333` + `QDRANT_API_KEY`).
+- Lần đầu chạy, model embedding (~550 MB) được tải từ Hugging Face (vài phút), sau đó dùng cache.
+- LLM nạp nền khoảng 5 s trên Metal; trước lúc đó `/health` báo `degraded` và chat trả 503 `llm unavailable`.
 
----
-
-## 🛠️ Installation & Execution
+## Chạy bằng Docker
 
 ```bash
-# 1. Install dependencies
-npm install
-
-# 2. Run in development watch mode
-npm run start:dev
-
-# 3. Build for production
-npm run build
-
-# 4. Run in production mode
-npm run start:prod
+export JWT_ACCESS_SECRET=... JWT_REFRESH_SECRET=...   # mỗi khoá >= 32 ký tự
+export QDRANT_API_KEY=...                              # key Qdrant của pipeline
+docker compose up --build                              # app :3000 + mongo (rs0)
+docker compose --profile standalone up                 # thêm Qdrant rỗng (không cần pipeline)
 ```
 
----
+Biến riêng cho compose có tiền tố `RAGTS_` (`RAGTS_QDRANT_URL`, `RAGTS_PORT`, `RAGTS_MODEL_FILE`, …) để không đụng `.env` dev mà compose tự đọc. Volume: `../model` ➔ `/models`, `../data` ➔ `/data`, cache Hugging Face ở volume `hf-cache`.
 
-## 🧪 Testing
+> Docker trên Mac không có Metal: LLM chạy CPU, Qwen 7B cần ~6 GB RAM cho container. Máy ảo Docker 8 GB chạy kèm container khác sẽ bị kill (exit 137) — tăng RAM Docker, hoặc chạy app ngoài Docker khi dev.
+
+## Biến môi trường
+
+| Biến | Bắt buộc | Mặc định | Ý nghĩa |
+| :-- | :--: | :-- | :-- |
+| `MONGO_URI` | ✓ | — | MongoDB (replica set) |
+| `QDRANT_URL` | ✓ | — | Qdrant |
+| `QDRANT_API_KEY` | | — | Key Qdrant |
+| `QDRANT_COLLECTION` | | `scientific_papers_gold` | Collection đọc |
+| `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | ✓ | — | ≥ 32 ký tự |
+| `EMBEDDING_MODEL` | | `nomic-ai/nomic-embed-text-v1.5` | Id Hub hoặc thư mục local |
+| `MODEL_PATH` | ✓ | — | File GGUF |
+| `LLM_GPU` | | `auto` | `auto` / `cuda` / `metal` / `vulkan` / `false` |
+| `LLM_CONCURRENCY` | | `1` | Số lượt sinh song song |
+| `LLM_MAX_QUEUE` | | `8` | Hàng chờ tối đa, đầy ➔ 429 |
+| `LLM_TIMEOUT_MS` | | `60000` | Quá hạn ➔ 504 |
+| `WORLD_DATA_DIR`, `MINING_DIR` | ✓ | — | File pipeline xuất |
+| `PORT` | | `3000` | |
+| `CORS_ORIGINS` | | `http://localhost:5173` | Phân tách bằng dấu phẩy |
+
+Thiếu biến bắt buộc ➔ app dừng (exit 1) và liệt kê đủ các biến lỗi.
+
+## Kiểm thử
 
 ```bash
-# Run unit tests
-npm run test
-
-# Run tests in watch mode
-npm run test:watch
-
-# Generate code coverage report
-npm run test:cov
-
-# Run End-to-End (E2E) tests
-npm run test:e2e
+npm test                                  # unit + integration (mongodb-memory-server, port giả)
+npm run test:e2e                          # cả app, LLM/embedding giả, Qdrant in-memory
+E2E_QDRANT_URL=http://localhost:6555 npm run test:e2e   # e2e với Qdrant thật (seed collection *_test)
+QDRANT_URL=... QDRANT_COLLECTION=rag_ts_test npx ts-node scripts/seed-qdrant.ts
+npx tsc --noEmit && npm run lint
 ```
 
----
+`scripts/seed-qdrant.ts` từ chối mọi collection không có hậu tố `_test`.
 
-## 📡 API Reference
+## Đồng bộ với frontend 3D (Phụ lục A, tóm tắt)
 
-### Health Check
-- **Endpoint**: `GET /`
-- **Response**: `Hello World!`
+| Điểm | Việc FE cần làm |
+| :-- | :-- |
+| Base URL | `VITE_API_BASE=/api/v1`, proxy Vite `/api/v1` ➔ `http://localhost:3000` |
+| `nprobe` | Đã hỗ trợ trong body chat (1–6, mặc định 2) |
+| Event SSE | Khớp; `done` có thêm `session_id`, `message_id` |
+| Health | Đọc `components.{mongo,qdrant,llm,world}` thay cho `{ lancedb, llm, world }` |
+| World 3D, luồng cào | Gọi pipeline UTH (`VITE_PIPELINE_BASE`), không qua RAG_TS |
 
-### RAG Chat / Generation
-- **Endpoint**: `POST /api/rag/chat`
-- **Request Body**:
-```json
-{
-  "query": "What are the latest techniques in diffusion models for video generation?",
-  "top_k": 5,
-  "use_mining_boost": true
-}
-```
-- **Response**:
-```json
-{
-  "answer": "Recent techniques in video diffusion models focus on spatio-temporal attention...",
-  "citations": [
-    {
-      "paper_id": "arxiv:2401.xxxxx",
-      "title": "Spatio-Temporal Diffusion for High-Fidelity Video",
-      "authors": ["Author A", "Author B"],
-      "section": "method",
-      "similarity_score": 0.884,
-      "authority_boost": 0.052
-    }
-  ],
-  "metrics": {
-    "embedding_ms": 42,
-    "retrieval_ms": 15,
-    "generation_ms": 1120,
-    "total_ms": 1177
-  }
-}
-```
+## Giới hạn đã biết
+
+- Pipeline chưa xuất file world (`tree.json`, centroid, `categories.json`) và payload `twig_id`, `chunk_index` (Phụ lục B) ➔ `route` rỗng, `compare` không lọc theo nhánh, `category_index` = -1.
+- Huỷ stream khi LLM còn đang đọc prompt dài: slot LLM chỉ giải phóng khi sinh tới token đầu (~15 s với `top_k` 5 trên Metal).
+- `prompt_fe_3d.md` (được tham chiếu trong kế hoạch) không có trong repo — định dạng world lấy theo type FE `frontend_rag/src/types/world.ts`.

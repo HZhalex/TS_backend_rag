@@ -1,65 +1,117 @@
-import { Injectable, OnModuleInit, BadRequestException, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  OnModuleInit,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { existsSync } from 'fs';
+import { LRUCache } from 'lru-cache';
+import { basename, dirname, resolve } from 'path';
+import { AppConfigService } from '../config/app-config.service';
+
+export const EMBEDDING_DIM = 768;
+export const QUERY_PREFIX = 'search_query: ';
+export const EMBEDDING_UNAVAILABLE = 'embedding unavailable';
+
+/** What the RAG pipeline needs from an embedder; mocked in tests. */
+export interface EmbeddingPort {
+  embedQuery(q: string): Promise<number[]>;
+  isReady(): boolean;
+}
+
+export const EMBEDDING_PORT = Symbol('EMBEDDING_PORT');
+
+/** Text ➔ mean-pooled, L2-normalised vector (same as the pipeline's NomicEmbedder). */
+export type Extractor = (text: string) => Promise<ArrayLike<number>>;
+
+/** Trim and collapse whitespace: the cache key and the text actually embedded. */
+export function normalizeQuery(q: string): string {
+  return q.trim().replace(/\s+/g, ' ');
+}
 
 @Injectable()
-export class EmbeddingService implements OnModuleInit {
+export class EmbeddingService implements EmbeddingPort, OnModuleInit {
   private readonly logger = new Logger(EmbeddingService.name);
-  private embedder: any = null;
-  private readonly expectedDimension = 768;
+  private extractor: Extractor | null = null;
+  private loading: Promise<Extractor | null> | null = null;
+  private readonly cache = new LRUCache<string, number[]>({
+    max: 500,
+    ttl: 10 * 60 * 1000,
+  });
 
-  private getModelName(): string {
-    const envModel = process.env.EMBEDDING_MODEL_PATH;
-    if (envModel && !envModel.startsWith('models/')) {
-      return envModel;
-    }
-    return 'nomic-ai/nomic-embed-text-v1.5';
+  constructor(private readonly config: AppConfigService) {}
+
+  onModuleInit(): void {
+    // Load in the background: the app serves auth/health while the model warms up.
+    void this.ensureLoaded();
   }
 
-  async onModuleInit(): Promise<void> {
-    const modelName = this.getModelName();
-    try {
-      this.logger.log(`Initializing embedding pipeline with model: ${modelName}...`);
-      const { pipeline } = await (Function('return import("@xenova/transformers")')() as Promise<any>);
-      this.embedder = await pipeline('feature-extraction', modelName);
-      this.logger.log(`Embedding model ${modelName} loaded successfully.`);
-    } catch (error) {
-      this.logger.error(`Failed to load embedding pipeline: ${(error as Error).message}`, (error as Error).stack);
-    }
+  isReady(): boolean {
+    return this.extractor !== null;
   }
 
-  /**
-   * Generates a 768-D normalized embedding vector for the user query.
-   * Enforces Nomic v1.5 asymmetric prefix `search_query: `.
-   */
-  async generateEmbedding(query: string): Promise<number[]> {
-    if (!query || query.trim() === '') {
-      throw new BadRequestException('Query cannot be empty');
-    }
+  async embedQuery(q: string): Promise<number[]> {
+    const text = normalizeQuery(q);
+    if (!text) throw new BadRequestException('query should not be empty');
+    const hit = this.cache.get(text);
+    if (hit) return hit;
 
-    if (!this.embedder) {
-      this.logger.warn('Embedder was not initialized; initializing on demand...');
-      await this.onModuleInit();
-    }
-
-    const formattedText = `search_query: ${query.trim()}`;
-
+    const extractor = await this.ensureLoaded();
+    if (!extractor)
+      throw new ServiceUnavailableException(EMBEDDING_UNAVAILABLE);
+    let raw: ArrayLike<number>;
     try {
-      const output = await this.embedder!(formattedText, {
-        pooling: 'mean',
-        normalize: true,
-      });
+      raw = await extractor(QUERY_PREFIX + text);
+    } catch (e) {
+      this.logger.error({ err: e }, 'EMBEDDING_FAILED');
+      throw new ServiceUnavailableException(EMBEDDING_UNAVAILABLE);
+    }
+    if (raw.length !== EMBEDDING_DIM) {
+      throw new Error(
+        `embedding has ${raw.length} dimensions, expected ${EMBEDDING_DIM}`,
+      );
+    }
+    const vector = Array.from(raw);
+    this.cache.set(text, vector);
+    return vector;
+  }
 
-      const vector = Array.from(output.data as Float32Array | number[]) as number[];
-
-      if (vector.length !== this.expectedDimension) {
-        throw new Error(
-          `Unexpected embedding dimension: got ${vector.length}, expected ${this.expectedDimension}`,
+  /** Loads the model once; concurrent callers share the same promise. A failed load can retry. */
+  private ensureLoaded(): Promise<Extractor | null> {
+    if (this.extractor) return Promise.resolve(this.extractor);
+    this.loading ??= this.loadExtractor()
+      .then((ex) => {
+        this.extractor = ex;
+        this.logger.log(
+          { model: this.config.get('EMBEDDING_MODEL') },
+          'EMBEDDING_READY',
         );
-      }
+        return ex;
+      })
+      .catch((e: unknown) => {
+        this.logger.error({ err: e }, 'EMBEDDING_LOAD_FAILED');
+        this.loading = null;
+        return null;
+      });
+    return this.loading;
+  }
 
-      return vector;
-    } catch (error) {
-      this.logger.error(`Error generating embedding for query: "${query}": ${(error as Error).message}`);
-      throw error;
+  /** Overridden in tests. A local directory is loaded offline, anything else is a Hub id. */
+  protected async loadExtractor(): Promise<Extractor> {
+    const { pipeline, env } = await import('@huggingface/transformers');
+    const model = this.config.get('EMBEDDING_MODEL');
+    const local = resolve(model);
+    let id = model;
+    if (existsSync(local)) {
+      env.localModelPath = dirname(local);
+      env.allowRemoteModels = false;
+      id = basename(local);
     }
+    const extract = await pipeline('feature-extraction', id, { dtype: 'fp32' });
+    return async (text: string) => {
+      const out = await extract(text, { pooling: 'mean', normalize: true });
+      return out.data as Float32Array;
+    };
   }
 }

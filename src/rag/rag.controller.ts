@@ -1,66 +1,146 @@
-import { Controller, Post, Get, Body, HttpCode, HttpStatus, Logger } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
-import { RagService } from './rag.service';
-import { QueryDto } from './dto/query.dto';
-import { RAGSynthesisResponseDto, HealthResponseDto } from './dto/response.dto';
-import { RAGSynthesisResponse } from '../types/scientific-rag';
-import { VectorStoreService } from '../vector-store/vector-store.service';
-import { LlmService } from '../llm/llm.service';
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Post,
+  Req,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiOkResponse,
+  ApiProduces,
+  ApiServiceUnavailableResponse,
+  ApiTags,
+  ApiTooManyRequestsResponse,
+} from '@nestjs/swagger';
+import type { Request, Response } from 'express';
+import { CurrentUser } from '../auth/current-user.decorator';
+import { OptionalJwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { toErrorBody } from '../common/http-exception.filter';
+import { logEvent, requestIdOf } from '../common/request-context';
+import { AbortedError } from '../llm/llm-queue';
+import type { AuthUser } from '../types/auth-user';
+import { ChatRequestDto } from './dto/chat-request.dto';
+import { ChatResponseDto } from './dto/chat-response.dto';
+import { PipelineEvent, PipelineResult, RagService } from './rag.service';
+import { abortOnClientClose, SseWriter } from './sse';
 
-@ApiTags('Scientific RAG')
-@Controller('api/rag')
+const CLIENT_CLOSED = 499;
+
+function statusOf(e: unknown): number {
+  return e instanceof HttpException ? e.getStatus() : 500;
+}
+
+@ApiTags('RAG')
+@ApiBearerAuth()
+@Controller('rag')
+@UseGuards(OptionalJwtAuthGuard)
 export class RagController {
-  private readonly logger = new Logger(RagController.name);
-
-  constructor(
-    private readonly ragService: RagService,
-    private readonly vectorStoreService: VectorStoreService,
-    private readonly llmService: LlmService,
-  ) {}
+  constructor(private readonly rag: RagService) {}
 
   @Post('chat')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Query Scientific Literature with RAG',
-    description:
-      'Performs 768-D dense vector search across 913k scientific paper chunks, applies co-authorship PageRank and association-rules hybrid reranking, and synthesizes a grounded answer using local Qwen2.5-7B with strict [Paper: {paper_id}] citations.',
+  @ApiOkResponse({ type: ChatResponseDto })
+  @ApiTooManyRequestsResponse({ description: 'llm queue is full' })
+  @ApiServiceUnavailableResponse({
+    description: 'qdrant unavailable / llm unavailable',
   })
-  @ApiBody({ type: QueryDto })
-  @ApiResponse({
-    status: HttpStatus.OK,
-    description: 'Successfully synthesized grounded answer with extracted academic citations and candidate chunks.',
-    type: RAGSynthesisResponseDto,
-  })
-  @ApiResponse({
-    status: HttpStatus.BAD_REQUEST,
-    description: 'Invalid input payload, missing query, or out-of-range top_k.',
-  })
-  async chat(@Body() queryDto: QueryDto): Promise<RAGSynthesisResponse> {
-    this.logger.log(`Received chat request: "${queryDto.query}"`);
-    return this.ragService.executeRagPipeline(queryDto);
+  async chat(
+    @Body() dto: ChatRequestDto,
+    @CurrentUser() user: AuthUser | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ChatResponseDto> {
+    const t0 = performance.now();
+    const ctrl = abortOnClientClose(res, 'CHAT_ABORTED');
+    const result: Partial<PipelineResult> = {};
+    try {
+      for await (const _ of this.rag.run(dto, user, ctrl.signal, result, t0)) {
+        if (ctrl.signal.aborted) break;
+      }
+    } catch (e) {
+      if (e instanceof AbortedError || ctrl.signal.aborted) {
+        logEvent('CHAT_ABORTED');
+        throw new HttpException('client closed request', CLIENT_CLOSED);
+      }
+      logEvent('CHAT_FAILED', { error_status: statusOf(e) });
+      throw e;
+    }
+    if (ctrl.signal.aborted) {
+      logEvent('CHAT_ABORTED');
+      throw new HttpException('client closed request', CLIENT_CLOSED);
+    }
+    logEvent('CHAT_OK');
+    const r = result as PipelineResult;
+    return {
+      session_id: r.session_id,
+      message_id: r.message_id,
+      query: dto.query,
+      answer: r.answer,
+      citations: r.citations,
+      grounded_chunks: r.grounded_chunks,
+      expanded_terms: r.expanded_terms,
+      timings: r.timings,
+    };
   }
 
-  @Get('health')
-  @ApiOperation({
-    summary: 'Health and Hardware Acceleration Status',
-    description:
-      'Returns the readiness of the LanceDB vector store, local LLM inference engine, and detailed GPU hardware acceleration status (NVIDIA CUDA / Apple Metal / CPU).',
+  /**
+   * SSE: `phase` ➔ `route` ➔ `compare` ➔ `retrieval` ➔ `token`… ➔ `done` | `error`. A failure before the
+   * first event is a normal HTTP error; after it, an `error` event replaces `done`.
+   */
+  @Post('chat/stream')
+  @ApiProduces('text/event-stream')
+  @ApiOkResponse({
+    description: 'text/event-stream of RagStreamEvent (API_DESIGN §3.1)',
   })
-  @ApiResponse({
-    status: HttpStatus.OK,
-    description: 'Service health and hardware acceleration diagnostics.',
-    type: HealthResponseDto,
-  })
-  getHealth(): HealthResponseDto {
-    return {
-      status: 'ok',
-      service: 'scientific-rag-backend',
-      timestamp: new Date().toISOString(),
-      components: {
-        vectorStore: this.vectorStoreService.isReady() ? 'ready' : 'connecting_or_fallback',
-        llm: this.llmService.isReady() ? 'ready' : 'fallback',
-        gpu: this.llmService.getGpuStatus(),
-      },
-    };
+  async stream(
+    @Body() dto: ChatRequestDto,
+    @CurrentUser() user: AuthUser | undefined,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const t0 = performance.now();
+    const ctrl = abortOnClientClose(res, 'CHAT_STREAM_ABORTED');
+    const events = this.rag.run(dto, user, ctrl.signal, {}, t0);
+    let r: IteratorResult<PipelineEvent>;
+    try {
+      r = await events.next();
+    } catch (e) {
+      logEvent('CHAT_FAILED', { error_status: statusOf(e) });
+      throw e; // headers not sent yet: the exception filter answers with HTTP status + §1.2 body
+    }
+
+    const sse = new SseWriter(res);
+    sse.open();
+    try {
+      while (!r.done) {
+        if (ctrl.signal.aborted) throw new AbortedError();
+        sse.send(r.value);
+        r = await events.next();
+      }
+      logEvent('CHAT_STREAM_OK');
+    } catch (e) {
+      if (e instanceof AbortedError || ctrl.signal.aborted) {
+        logEvent('CHAT_STREAM_ABORTED');
+      } else {
+        const body = toErrorBody(e, requestIdOf(req));
+        sse.send({
+          type: 'error',
+          message: body.message,
+          status: body.statusCode,
+        });
+        logEvent('CHAT_FAILED', { error_status: body.statusCode });
+        if (!(e instanceof HttpException)) {
+          (res as Response & { err?: Error }).err =
+            e instanceof Error ? e : new Error(String(e));
+        }
+      }
+    } finally {
+      await events.return(undefined);
+      sse.close();
+    }
   }
 }

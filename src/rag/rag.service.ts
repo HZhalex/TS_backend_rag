@@ -1,109 +1,198 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { EmbeddingService } from '../embedding/embedding.service';
-import { VectorStoreService } from '../vector-store/vector-store.service';
-import { MiningService } from '../mining/mining.service';
-import { LlmService } from '../llm/llm.service';
+import { Inject, Injectable } from '@nestjs/common';
+import { logFields } from '../common/request-context';
 import {
-  GroundedChunkResult,
-  RAGSearchRequest,
-  RAGSynthesisResponse,
+  EMBEDDING_PORT,
+  type EmbeddingPort,
+} from '../embedding/embedding.service';
+import { LLM_PORT, type LlmPort } from '../llm/llm.service';
+import { MiningService, round4 } from '../mining/mining.service';
+import {
+  SESSION_STORE,
+  type SessionStorePort,
+} from '../chat-sessions/session-store.port';
+import { TreeRouterService } from '../tree-router/tree-router.service';
+import type { AuthUser } from '../types/auth-user';
+import type {
+  CompareCandidate,
+  GroundedChunk,
+  RagStreamEvent,
+  ScoredChunk,
+  Timings,
 } from '../types/scientific-rag';
+import {
+  VECTOR_STORE_PORT,
+  type VectorStorePort,
+} from '../vector-store/vector-store.service';
+import { extractCitations } from './citations';
+import type { ChatRequestDto } from './dto/chat-request.dto';
+import {
+  buildUserPrompt,
+  NO_CONTEXT_ANSWER,
+  SYSTEM_PROMPT,
+} from './prompt-builder';
 
-const STRICT_ACADEMIC_GROUNDING_PROMPT = `You are a strictly grounded scientific research assistant specializing in AI and Machine Learning.
-Your mission is to provide rigorous, truthful, and accurate technical answers based EXCLUSIVELY on the retrieved scientific literature excerpts below.
+export const MAX_COMPARE_PAPERS = 30;
 
-CRITICAL OPERATIONAL RULES:
-1. STRICT FACTUAL GROUNDING: Rely SOLELY on facts explicitly stated in the provided excerpts. Never extrapolate or utilize parametric memory for experimental numbers, hyperparameters, or author claims.
-2. MISSING INFORMATION PROTOCOL: If the provided excerpts do not contain the answer, state: "The provided literature does not contain sufficient details regarding [aspect]."
-3. MANDATORY CITATIONS: Every substantive technical claim, architectural detail, and performance metric must cite the exact paper using \`[Paper: {paper_id}]\`.
-4. PRESERVE LATEX: Keep mathematical formulas intact using $...$ or $$...$$.
-5. DIRECT & CONCISE: Answer directly without conversational pleasantries.`;
+/** Events the pipeline yields (errors are thrown, the controller turns them into `error`). */
+export type PipelineEvent = Exclude<RagStreamEvent, { type: 'error' }>;
+
+/** Summary of a finished run, for the non-streaming response and the request log. */
+export interface PipelineResult {
+  answer: string;
+  citations: string[];
+  grounded_chunks: GroundedChunk[];
+  expanded_terms: string[];
+  timings: Timings;
+  session_id: string | null;
+  message_id: string | null;
+}
+
+/** Best score per paper, highest first, at most `limit` papers. */
+export function topPapers(
+  hits: ScoredChunk[],
+  limit = MAX_COMPARE_PAPERS,
+): CompareCandidate[] {
+  const best = new Map<string, number>();
+  for (const h of hits) {
+    if (h.score > (best.get(h.paper_id) ?? -Infinity))
+      best.set(h.paper_id, h.score);
+  }
+  return [...best.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([paper_id, score]) => ({ paper_id, score: round4(score) }));
+}
+
+const since = (t: number) => Math.round(performance.now() - t);
 
 @Injectable()
 export class RagService {
-  private readonly logger = new Logger(RagService.name);
-
   constructor(
-    private readonly embeddingService: EmbeddingService,
-    private readonly vectorStoreService: VectorStoreService,
-    private readonly miningService: MiningService,
-    private readonly llmService: LlmService,
+    @Inject(EMBEDDING_PORT) private readonly embedding: EmbeddingPort,
+    @Inject(VECTOR_STORE_PORT) private readonly vectors: VectorStorePort,
+    @Inject(LLM_PORT) private readonly llm: LlmPort,
+    @Inject(SESSION_STORE) private readonly sessions: SessionStorePort,
+    private readonly mining: MiningService,
+    private readonly router: TreeRouterService,
   ) {}
 
   /**
-   * Execute the end-to-end RAG pipeline from retrieval to grounded answer synthesis.
+   * The full RAG run as an event stream (API_DESIGN §3.1). `result` is filled in before `done`.
+   * Nothing is saved when the run fails or `signal` aborts.
    */
-  async executeRagPipeline(request: RAGSearchRequest): Promise<RAGSynthesisResponse> {
-    const startTime = Date.now();
-    const { query, top_k = 5, category, use_authority_boost = true, expand_query = false } = request;
+  async *run(
+    req: ChatRequestDto,
+    user: AuthUser | undefined,
+    signal: AbortSignal,
+    result: Partial<PipelineResult> = {},
+    t0 = performance.now(),
+  ): AsyncGenerator<PipelineEvent> {
+    const timings: Timings = {
+      embed_ms: 0,
+      route_ms: 0,
+      search_ms: 0,
+      rerank_ms: 0,
+      llm_ms: 0,
+      total_ms: 0,
+    };
+    logFields({ query_len: req.query.length, top_k: req.top_k });
+    const sessionId = user && req.session_id ? req.session_id : null;
+    if (user && sessionId) await this.sessions.assertOwned(sessionId, user.id);
 
-    this.logger.log(`Executing RAG pipeline for query: "${query}" (topK: ${top_k}, category: ${category || 'any'})`);
+    yield { type: 'phase', phase: 'embedding' };
+    const question = req.query;
+    const expanded = req.expand_query
+      ? this.mining.expandQueryTerms(question)
+      : [];
+    let t = performance.now();
+    const q = await this.embedding.embedQuery(
+      expanded.length ? `${question} ${expanded.join(' ')}` : question,
+    );
+    timings.embed_ms = since(t);
 
-    // 1. Query Expansion (if enabled)
-    let searchInput = query;
-    if (expand_query) {
-      const expandedTerms = this.miningService.expandQueryTerms(query);
-      if (expandedTerms.length > 0) {
-        searchInput = `${query} ${expandedTerms.join(' ')}`;
-        this.logger.log(`Query expanded to: "${searchInput}"`);
+    yield { type: 'phase', phase: 'flying' };
+    const { steps, route_ms } = this.router.route(q, req.nprobe);
+    timings.route_ms = route_ms;
+    yield { type: 'route', steps };
+
+    yield { type: 'phase', phase: 'comparing' };
+    t = performance.now();
+    const twigIds = steps.find((s) => s.depth === 2)?.chosen;
+    const hits = await this.vectors.search(q, {
+      limit: Math.max(40, req.top_k * 8),
+      category: req.category,
+      twigIds: twigIds?.length ? twigIds : undefined,
+    });
+    timings.search_ms = since(t);
+    yield { type: 'compare', candidates: topPapers(hits) };
+
+    yield { type: 'phase', phase: 'found' };
+    t = performance.now();
+    const grounded = this.mining
+      .rerank(hits, req.use_authority_boost)
+      .slice(0, req.top_k);
+    timings.rerank_ms = since(t);
+    yield {
+      type: 'retrieval',
+      grounded_chunks: grounded,
+      expanded_terms: expanded,
+    };
+
+    yield { type: 'phase', phase: 'generating' };
+    t = performance.now();
+    let answer = '';
+    if (!grounded.length) {
+      answer = NO_CONTEXT_ANSWER;
+      yield { type: 'token', text: answer };
+    } else {
+      for await (const token of this.llm.generate(
+        SYSTEM_PROMPT,
+        buildUserPrompt(grounded, question),
+        signal,
+      )) {
+        answer += token;
+        yield { type: 'token', text: token };
       }
     }
+    timings.llm_ms = since(t);
 
-    // 2. Generate 768-D Query Vector Embedding
-    const queryVector = await this.embeddingService.generateEmbedding(searchInput);
+    const citations = extractCitations(answer);
+    const inContext = new Set(grounded.map((g) => g.paper_id));
+    logFields({
+      chunks: grounded.length,
+      unverified_citations: citations.filter((c) => !inContext.has(c)).length,
+    });
 
-    // 3. Dense Vector ANN Search in LanceDB
-    const candidateChunks = await this.vectorStoreService.search(queryVector, top_k, category);
+    let saved: { session_id: string; assistant_message_id: string } | null =
+      null;
+    if (user && !signal.aborted) {
+      timings.total_ms = since(t0);
+      saved = await this.sessions.saveExchange(user.id, sessionId, question, {
+        content: answer,
+        citations,
+        grounded_chunks: grounded,
+        timings,
+      });
+    }
+    timings.total_ms = since(t0);
+    logFields({ timings });
 
-    // 4. Hybrid Reranking with PageRank Authority Boost
-    const rerankedChunks = this.miningService.rerankChunks(candidateChunks, use_authority_boost);
-    const topChunks: GroundedChunkResult[] = rerankedChunks.slice(0, top_k);
-
-    // 5. Build Academic Grounding Context & Prompt
-    const contextBlocks = topChunks
-      .map(
-        (c) =>
-          `--- [Paper ID: ${c.paper_id} | Title: "${c.title}" | Section: ${c.section_title}] ---\n${c.text.trim()}`,
-      )
-      .join('\n\n');
-
-    const userPrompt = `Retrieved Scientific Context:\n${contextBlocks}\n\nUser Question: ${query}`;
-
-    // 6. Local LLM Synthesis via node-llama-cpp
-    const answer = await this.llmService.generateGroundedAnswer(
-      STRICT_ACADEMIC_GROUNDING_PROMPT,
-      userPrompt,
-    );
-
-    // 7. Extract Unique Citations ([Paper: {paper_id}])
-    const citations = this.extractCitations(answer);
-
-    const latency_ms = Date.now() - startTime;
-    this.logger.log(`RAG pipeline completed in ${latency_ms}ms with ${citations.length} citations.`);
-
-    return {
-      query,
+    Object.assign(result, {
       answer,
       citations,
-      grounded_chunks: topChunks,
-      latency_ms,
+      grounded_chunks: grounded,
+      expanded_terms: expanded,
+      timings,
+      session_id: saved?.session_id ?? null,
+      message_id: saved?.assistant_message_id ?? null,
+    } satisfies PipelineResult);
+
+    yield {
+      type: 'done',
+      citations,
+      timings,
+      session_id: saved?.session_id ?? null,
+      message_id: saved?.assistant_message_id ?? null,
     };
-  }
-
-  /**
-   * Extract citations using regex [Paper: {paper_id}].
-   */
-  public extractCitations(text: string): string[] {
-    const citationRegex = /\[Paper:\s*([^\]]+)\]/g;
-    const matches = Array.from(text.matchAll(citationRegex));
-    const unique = new Set<string>();
-
-    for (const match of matches) {
-      if (match[1]) {
-        unique.add(match[1].trim());
-      }
-    }
-
-    return Array.from(unique);
   }
 }

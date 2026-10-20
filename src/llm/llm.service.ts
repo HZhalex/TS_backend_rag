@@ -1,140 +1,152 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import * as path from 'path';
-import * as fs from 'fs';
-import type { Llama, LlamaModel, LlamaContext } from 'node-llama-cpp';
-import { detectGpu, GpuInfo } from '../utils/gpu.util';
+import {
+  GatewayTimeoutException,
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleInit,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { basename } from 'path';
+import { AppConfigService } from '../config/app-config.service';
+import { LLM_ENGINE, LlmEngine } from './llm-engine';
+import { AbortedError, LlmQueue, QueueFullError, Release } from './llm-queue';
+import { TokenChannel } from './token-channel';
+
+export const LLM_UNAVAILABLE = 'llm unavailable';
+export const LLM_QUEUE_FULL = 'llm queue is full';
+export const LLM_TIMEOUT = 'llm timeout';
+export const TEMPERATURE = 0.2;
+export const MAX_TOKENS = 1024;
+
+export interface LlmStatus {
+  ready: boolean;
+  model_id: string;
+  gpu: string;
+  queue_length: number;
+}
+
+/** What the RAG pipeline needs from the LLM; mocked in tests. */
+export interface LlmPort {
+  /** Streams answer tokens. Throws 503 (not loaded), 429 (queue full), 504 (timeout), AbortedError. */
+  generate(
+    system: string,
+    user: string,
+    signal: AbortSignal,
+  ): AsyncIterable<string>;
+  status(): LlmStatus;
+}
+
+export const LLM_PORT = Symbol('LLM_PORT');
+
+export { AbortedError };
 
 @Injectable()
-export class LlmService implements OnModuleInit {
+export class LlmService implements LlmPort, OnModuleInit {
   private readonly logger = new Logger(LlmService.name);
-  private llama: Llama | null = null;
-  private model: LlamaModel | null = null;
-  private context: LlamaContext | null = null;
-  private chatSessionClass: any = null;
-  private gpuInfo: GpuInfo | null = null;
+  private readonly queue: LlmQueue;
+  private readonly timeoutMs: number;
+  private readonly modelId: string;
+  private ready = false;
+  private gpu = 'unknown';
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    @Inject(LLM_ENGINE) private readonly engine: LlmEngine,
+    config: AppConfigService,
+  ) {
+    this.queue = new LlmQueue(
+      config.get('LLM_CONCURRENCY'),
+      config.get('LLM_MAX_QUEUE'),
+    );
+    this.timeoutMs = config.get('LLM_TIMEOUT_MS');
+    this.modelId = basename(config.get('MODEL_PATH')).replace(/\.gguf$/i, '');
+  }
 
-  async onModuleInit(): Promise<void> {
-    this.gpuInfo = detectGpu();
-    this.logger.log(`GPU Detection Status: ${this.gpuInfo.details} (Backend: ${this.gpuInfo.type})`);
+  onModuleInit(): void {
+    // Loading a 7B model takes a while: do it in the background, health reports `ready`.
+    void this.load();
+  }
 
-    const modelPath =
-      this.configService.get<string>('LLM_MODEL_PATH') ||
-      this.configService.get<string>('MODEL_PATH') ||
-      'models/qwen2.5-7b-instruct-q4_k_m/qwen2.5-7b-instruct-q4_k_m.gguf';
-
-    const resolvedPath = this.resolveModelPath(modelPath);
-
-    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
-      this.logger.warn(
-        `LLM model file not found at: ${modelPath}. LlmService will operate in fallback mode until the model file is available.`,
-      );
-      return;
-    }
-
+  async load(): Promise<void> {
     try {
-      this.logger.log(`Loading local Qwen2.5-7B GGUF model from: ${resolvedPath}...`);
-      const nodeLlamaCpp = await (Function('return import("node-llama-cpp")')() as Promise<any>);
-      this.chatSessionClass = nodeLlamaCpp.LlamaChatSession;
-
-      this.llama = await nodeLlamaCpp.getLlama({
-        gpu: this.gpuInfo.nodeLlamaGpuOption,
-      });
-
-      const gpuLayers = this.gpuInfo.hasGpu
-        ? Number(this.configService.get<string>('GPU_LAYERS') || 99)
-        : 0;
-
-      this.model = await this.llama!.loadModel({
-        modelPath: resolvedPath,
-        gpuLayers,
-      });
-
-      const contextSize = Number(
-        this.configService.get<string>('LLM_CONTEXT_SIZE') ||
-        this.configService.get<string>('CONTEXT_SIZE') ||
-        4096,
-      );
-
-      const sequences = Number(this.configService.get<string>('LLM_SEQUENCES') || 2);
-
-      this.context = await this.model.createContext({
-        contextSize,
-        sequences,
-      });
-
-      this.logger.log(
-        `Qwen2.5-7B GGUF Model loaded successfully with ${gpuLayers} GPU layers on ${this.gpuInfo.type.toUpperCase()}.`,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Failed to load node-llama-cpp model: ${(error as Error).message}`,
-        (error as Error).stack,
-      );
+      const { gpu } = await this.engine.load();
+      this.gpu = gpu;
+      this.ready = true;
+      this.logger.log({ model_id: this.modelId, gpu }, 'LLM_READY');
+    } catch (e) {
+      this.logger.error({ err: e, model_id: this.modelId }, 'LLM_LOAD_FAILED');
     }
   }
 
-  private resolveModelPath(modelPath: string): string | null {
-    const candidates = [
-      path.isAbsolute(modelPath) ? modelPath : path.resolve(process.cwd(), modelPath),
-      path.resolve(process.cwd(), '..', modelPath),
-      path.resolve(process.cwd(), 'models/qwen2.5-7b-instruct-q4_k_m/qwen2.5-7b-instruct-q4_k_m.gguf'),
-      path.resolve(process.cwd(), '../models/qwen2.5-7b-instruct-q4_k_m/qwen2.5-7b-instruct-q4_k_m.gguf'),
-      'C:\\document\\Study documents\\Uth-Data-Mining\\models\\qwen2.5-7b-instruct-q4_k_m\\qwen2.5-7b-instruct-q4_k_m.gguf',
-    ];
+  status(): LlmStatus {
+    return {
+      ready: this.ready,
+      model_id: this.modelId,
+      gpu: this.gpu,
+      queue_length: this.queue.length,
+    };
+  }
 
-    for (const p of candidates) {
-      if (fs.existsSync(p)) {
-        return p;
+  async *generate(
+    system: string,
+    user: string,
+    signal: AbortSignal,
+  ): AsyncIterable<string> {
+    if (!this.ready) throw new ServiceUnavailableException(LLM_UNAVAILABLE);
+    let release: Release;
+    try {
+      release = await this.queue.acquire(signal);
+    } catch (e) {
+      if (e instanceof QueueFullError) {
+        throw new HttpException(LLM_QUEUE_FULL, HttpStatus.TOO_MANY_REQUESTS);
       }
-    }
-    return candidates[0];
-  }
-
-  /**
-   * Generates grounded academic answer with low temperature (0.2).
-   */
-  async generateGroundedAnswer(
-    systemPrompt: string,
-    userPrompt: string,
-  ): Promise<string> {
-    if (!this.context || !this.chatSessionClass) {
-      this.logger.warn('LLM context not loaded. Returning simulation response.');
-      return 'The provided literature does not contain sufficient details regarding this query (Model in fallback mode).';
+      throw e;
     }
 
-    const sequence = this.context.getSequence();
+    // The turn stops on client abort, on timeout, or when the consumer stops iterating.
+    const stop = new AbortController();
+    const onAbort = () => stop.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop.abort();
+    }, this.timeoutMs);
+
+    const channel = new TokenChannel();
+    const finished = this.engine
+      .generate(system, user, {
+        temperature: TEMPERATURE,
+        maxTokens: MAX_TOKENS,
+        signal: stop.signal,
+        onToken: (t) => channel.push(t),
+      })
+      .then(
+        () => channel.close(),
+        (e: unknown) => channel.fail(e),
+      );
+
     try {
-      const session = new this.chatSessionClass({
-        contextSequence: sequence,
-        systemPrompt,
-      });
-
-      const maxTokens = Number(this.configService.get<string>('LLM_MAX_TOKENS') || 2048);
-
-      const response = await session.prompt(userPrompt, {
-        temperature: 0.2,
-        maxTokens,
-      });
-
-      return response;
-    } catch (error) {
-      this.logger.error(`Error during LLM inference: ${(error as Error).message}`);
-      throw error;
+      try {
+        for await (const token of channel) {
+          if (stop.signal.aborted) break;
+          yield token;
+        }
+      } catch (e) {
+        if (timedOut) throw new GatewayTimeoutException(LLM_TIMEOUT);
+        if (signal.aborted) throw new AbortedError();
+        this.logger.error({ err: e }, 'LLM_GENERATION_FAILED');
+        throw new ServiceUnavailableException(LLM_UNAVAILABLE);
+      }
+      if (timedOut) throw new GatewayTimeoutException(LLM_TIMEOUT);
+      if (signal.aborted) throw new AbortedError();
     } finally {
-      if (sequence && typeof sequence.dispose === 'function') {
-        sequence.dispose();
-      }
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      stop.abort();
+      await finished;
+      release();
     }
-  }
-
-  isReady(): boolean {
-    return this.context !== null;
-  }
-
-  getGpuStatus(): GpuInfo | null {
-    return this.gpuInfo;
   }
 }

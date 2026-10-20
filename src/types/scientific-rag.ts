@@ -1,6 +1,6 @@
 /**
- * Standard Types & Interfaces for UTH Scientific Literature RAG System
- * Conforms to docs/RAG.md and docs/prompt.md (Feature F1)
+ * Types shared by the RAG pipeline and the API (snake_case, matching API_DESIGN.md §3, §5 and the
+ * frontend `src/types/rag.ts` / `world.ts`).
  */
 
 export type SectionType =
@@ -11,116 +11,137 @@ export type SectionType =
   | 'discussion'
   | 'other';
 
-/**
- * 1. ScientificChunk: Represents a single record row in LanceDB table `scientific_papers_gold`.
- */
-export interface ScientificChunk {
+/** Chunk as stored in Qdrant `scientific_papers_gold` (written by the UTH pipeline). */
+export interface ChunkPayload {
   chunk_id: string;
   paper_id: string;
   title: string;
   authors: string[];
   primary_category: string;
+  year: number | null;
   section_title: string;
-  section_type: SectionType | string;
+  /** Raw pipeline value (e.g. "abstract", "body", "abstract_problem"). */
+  section_type: string;
   text: string;
-  context_text: string;
-  word_count: number;
-  vector?: number[];
-  _distance?: number;
+  twig_id?: number;
+  chunk_index?: number;
 }
 
-/**
- * 2. PaperSection: Structure of a parsed section within full-text paper metadata.
- */
-export interface PaperSection {
-  section_id: string;
-  section_title: string;
-  section_type: SectionType | string;
-  content: string;
-  paragraphs: string[];
+export interface ScoredChunk extends ChunkPayload {
+  /** Cosine similarity returned by Qdrant. */
+  score: number;
 }
 
-/**
- * 3. ScientificPaperSilver: Full paper metadata from Silver parquet lakehouse tier.
- */
-export interface ScientificPaperSilver {
-  paper_id: string;
-  abstract_hash: string;
-  doi: string | null;
-  journal_ref: string | null;
-  title: string;
-  abstract: string;
-  authors: string[];
-  categories: string[];
-  primary_category: string;
-  published_date: string;
-  crawled_at: string;
-  pdf_url: string;
-  html_url: string;
-  total_sections: number;
-  total_math_count: number;
-  total_words: number;
-  sections_json: string | PaperSection[];
-  clean_full_text: string;
-  transformed_at: string;
-  cite_count: number;
-  year: number;
-}
-
-/**
- * 4. GraphInfluencer: Influencer node structure from graph_coauthorship.json PageRank.
- */
-export interface GraphInfluencer {
-  author: string;
-  pagerank: number;
-  degree?: number;
-}
-
-/**
- * 5. AssociationRule: FP-Growth frequent itemset rule structure from association_rules.json.
- */
-export interface AssociationRule {
-  antecedents: string[];
-  consequents: string[];
-  support: number;
-  confidence: number;
-  lift: number;
-}
-
-/**
- * 6. RAGSearchRequest: Search query input parameters for retrieval & generation.
- */
-export interface RAGSearchRequest {
-  query: string;
-  top_k?: number;
-  category?: string;
-  use_authority_boost?: boolean;
-  expand_query?: boolean;
-}
-
-/**
- * 7. GroundedChunkResult: Candidate chunk scored by vector similarity and graph authority boost.
- */
-export interface GroundedChunkResult {
+/** A chunk retrieved as context for the answer. */
+export interface GroundedChunk {
   chunk_id: string;
   paper_id: string;
   title: string;
-  authors: string[];
   section_title: string;
+  section_type: SectionType;
   text: string;
   similarity_score: number;
-  authority_score?: number;
+  authority_score: number;
   final_score: number;
-  citation_tag: `[Paper: ${string}]` | string;
+  citation_tag: string;
 }
 
-/**
- * 8. RAGSynthesisResponse: Complete response returned by RAG pipeline.
- */
-export interface RAGSynthesisResponse {
-  query: string;
-  answer: string;
-  citations: string[];
-  grounded_chunks: GroundedChunkResult[];
-  latency_ms: number;
+export interface Timings {
+  embed_ms: number;
+  route_ms: number;
+  search_ms: number;
+  rerank_ms: number;
+  llm_ms: number;
+  total_ms: number;
+}
+
+export interface RouteCandidate {
+  node_id: number;
+  score: number;
+}
+
+export interface RouteStep {
+  depth: 1 | 2;
+  candidates: RouteCandidate[];
+  chosen: number[];
+}
+
+export interface CompareCandidate {
+  paper_id: string;
+  score: number;
+}
+
+export type RagPhase =
+  'embedding' | 'flying' | 'comparing' | 'found' | 'generating';
+
+/** One SSE event of `POST /rag/chat/stream` (API_DESIGN §3.1). */
+export type RagStreamEvent =
+  | { type: 'phase'; phase: RagPhase }
+  | { type: 'route'; steps: RouteStep[] }
+  | { type: 'compare'; candidates: CompareCandidate[] }
+  | {
+      type: 'retrieval';
+      grounded_chunks: GroundedChunk[];
+      expanded_terms: string[];
+    }
+  | { type: 'token'; text: string }
+  | {
+      type: 'done';
+      citations: string[];
+      timings: Timings;
+      session_id: string | null;
+      message_id: string | null;
+    }
+  | { type: 'error'; message: string; status: number };
+
+export interface Chunk {
+  chunk_id: string;
+  section_title: string;
+  section_type: SectionType;
+  text: string;
+}
+
+/** `GET /papers/:paper_id` (API_DESIGN §5). */
+export interface PaperDetail {
+  paper_id: string;
+  title: string;
+  authors: string[];
+  category_index: number;
+  primary_category: string;
+  year: number | null;
+  abstract: string;
+  has_fulltext: boolean;
+  chunks: Chunk[];
+}
+
+const SECTION_TYPES: readonly SectionType[] = [
+  'abstract',
+  'introduction',
+  'method',
+  'experiment',
+  'discussion',
+  'other',
+];
+
+/** Maps a raw pipeline section type onto the six kinds the frontend colours. */
+export function toSectionType(raw: string): SectionType {
+  const s = raw.toLowerCase();
+  if ((SECTION_TYPES as readonly string[]).includes(s)) return s as SectionType;
+  if (s.startsWith('abstract')) return 'abstract';
+  if (s.startsWith('intro')) return 'introduction';
+  if (
+    s.startsWith('method') ||
+    s.includes('approach') ||
+    s.includes('architecture')
+  )
+    return 'method';
+  if (
+    s.startsWith('experiment') ||
+    s.startsWith('result') ||
+    s.includes('evaluation')
+  )
+    return 'experiment';
+  if (s.startsWith('discussion') || s.startsWith('conclusion'))
+    return 'discussion';
+  return 'other';
 }

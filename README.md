@@ -27,7 +27,7 @@ npm ci
 npm run start:dev           # http://localhost:3000/api/v1
 ```
 
-- Cần MongoDB replica set: `docker compose up -d mongo` (rồi `MONGO_URI=mongodb://localhost:27017/rag_ts?replicaSet=rs0&directConnection=true` nếu map cổng), hoặc Mongo sẵn có.
+- Cần MongoDB replica set: `docker compose up -d mongo` rồi `MONGO_URI=mongodb://localhost:27018/rag_ts?replicaSet=rs0&directConnection=true` (cổng host đổi bằng `RAGTS_MONGO_PORT`).
 - Qdrant: dùng Qdrant của pipeline (`QDRANT_URL=http://localhost:6333` + `QDRANT_API_KEY`).
 - Lần đầu chạy, model embedding (~550 MB) được tải từ Hugging Face (vài phút), sau đó dùng cache.
 - LLM nạp nền khoảng 5 s trên Metal; trước lúc đó `/health` báo `degraded` và chat trả 503 `llm unavailable`.

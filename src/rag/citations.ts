@@ -1,7 +1,8 @@
-const CITATION_RE = /\[Paper:\s*([^\]]+)\]/g;
+/** `[Paper: id]`, `[Paper: a, b]`; also `[Paper ID: id | Title …]` (the model copying a header). */
+const CITATION_RE = /\[Paper(?:\s+ID)?:\s*([^\]|]+)[^\]]*\]/g;
 
 /**
- * Paper ids cited as `[Paper: id]` or `[Paper: id1, id2]`, in order of first appearance, no
+ * Paper ids cited as `[Paper: id]`, `[Paper: id1, id2]` or `[Paper ID: id | …]`, in order of first appearance, no
  * duplicates. Ids outside the retrieved context are kept (the frontend marks them unverified).
  */
 export function extractCitations(answer: string): string[] {

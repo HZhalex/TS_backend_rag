@@ -69,3 +69,6 @@
 - [B11] Biến của compose dùng tiền tố `RAGTS_` — compose tự đọc `.env` của thư mục (đang chứa cấu hình dev cũ `QDRANT_URL=http://localhost:6333`), trùng tên sẽ trỏ container vào chính nó.
 - [B11] Kiểm chứng `docker compose up`: app `healthy`, `/health` = `degraded` (mongo ✓, qdrant ✓, chưa có model) đúng tiêu chí B11.3. Với model 7B thật, container bị kill (137) do máy ảo Docker chỉ 7,7 GB dùng chung — ghi trong README.
 - [B11] Cập nhật `docs/API_DESIGN.md`: thêm `nprobe` vào ChatReq (§3, Phụ lục A2), `world` + `world_version` vào Health (§6, Phụ lục A5/A7).
+- [FE-live] Chạy thật với FE: Qwen hay chép nguyên tiêu đề ngữ cảnh `[Paper ID: x | Title …]` và viết toán bằng `\(…\)`. Đã đổi tiêu đề ngữ cảnh thành `--- [Paper: id] "Title" — Section: … ---` (đúng tag cần trích), quy tắc 3–4 của system prompt nói rõ định dạng; `extractCitations` chấp nhận thêm `[Paper ID: id | …]`.
+- [FE-live] `CORS_ORIGINS` mặc định `http://localhost:5174` — cổng 5173 là frontend của pipeline UTH, FE RAG_TS chuyển sang 5174.
+- [FE-live] Compose map Mongo ra host cổng 27018 (`RAGTS_MONGO_PORT`) để chạy app ngoài Docker: `MONGO_URI=mongodb://localhost:27018/rag_ts?replicaSet=rs0&directConnection=true`.

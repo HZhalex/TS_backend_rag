@@ -13,6 +13,10 @@ services:
   mongo:
     image: mongo:7
     command: ['--replSet', 'rs0', '--bind_ip_all']
+    # Host port for running the app outside Docker (27017 is often taken):
+    # MONGO_URI=mongodb://localhost:27018/rag_ts?replicaSet=rs0&directConnection=true
+    ports:
+      - '${RAGTS_MONGO_PORT:-27018}:27017'
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -53,7 +57,7 @@ services:
       LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-120000}
       WORLD_DATA_DIR: /data/world
       MINING_DIR: /data/gold/mining
-      CORS_ORIGINS: ${RAGTS_CORS_ORIGINS:-http://localhost:5173}
+      CORS_ORIGINS: ${RAGTS_CORS_ORIGINS:-http://localhost:5174}
     volumes:
       - ../model:/models:ro
       - ../data:/data:ro

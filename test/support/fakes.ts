@@ -33,7 +33,7 @@ export class FakeLlmEngine implements LlmEngine {
     user: string,
     o: GenerateOptions,
   ): Promise<void> {
-    const id = /Paper ID: ([^ |]+)/.exec(user)?.[1] ?? 'none';
+    const id = /\[Paper: ([^\]]+)\]/.exec(user)?.[1] ?? 'none';
     for (const t of ['Grounded ', 'answer ', `[Paper: ${id}].`]) {
       if (o.signal.aborted) return;
       await new Promise((r) => setImmediate(r));

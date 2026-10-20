@@ -30,7 +30,7 @@ export const envSchema = z.object({
   LLM_TIMEOUT_MS: int(60000, 1000),
   WORLD_DATA_DIR: required('WORLD_DATA_DIR'),
   MINING_DIR: required('MINING_DIR'),
-  CORS_ORIGINS: z.string().default('http://localhost:5173'),
+  CORS_ORIGINS: z.string().default('http://localhost:5174'),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

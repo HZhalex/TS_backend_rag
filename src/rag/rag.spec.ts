@@ -136,6 +136,14 @@ describe('extractCitations', () => {
   });
 
   it('none ➔ []', () => expect(extractCitations('no refs')).toEqual([]));
+
+  it('accepts a copied context header [Paper ID: id | Title …]', () => {
+    expect(
+      extractCitations(
+        'see [Paper ID: 2403.04303 | Title: "LORS" | Section: Method] and [Paper: 2106.09685]',
+      ),
+    ).toEqual(['2403.04303', '2106.09685']);
+  });
 });
 
 describe('topPapers', () => {

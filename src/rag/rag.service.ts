@@ -31,8 +31,6 @@ import {
   SYSTEM_PROMPT,
 } from './prompt-builder';
 
-export const MAX_COMPARE_PAPERS = 30;
-
 /** Events the pipeline yields (errors are thrown, the controller turns them into `error`). */
 export type PipelineEvent = Exclude<RagStreamEvent, { type: 'error' }>;
 
@@ -50,7 +48,7 @@ export interface PipelineResult {
 /** Best score per paper, highest first, at most `limit` papers. */
 export function topPapers(
   hits: ScoredChunk[],
-  limit = MAX_COMPARE_PAPERS,
+  limit: number,
 ): CompareCandidate[] {
   const best = new Map<string, number>();
   for (const h of hits) {
@@ -124,7 +122,7 @@ export class RagService {
       twigIds: twigIds?.length ? twigIds : undefined,
     });
     timings.search_ms = since(t);
-    yield { type: 'compare', candidates: topPapers(hits) };
+    yield { type: 'compare', candidates: topPapers(hits, req.top_k) };
 
     yield { type: 'phase', phase: 'found' };
     t = performance.now();

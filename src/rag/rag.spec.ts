@@ -147,10 +147,13 @@ describe('extractCitations', () => {
 });
 
 describe('topPapers', () => {
-  it('groups by paper with the best score, max 30', () => {
+  it('groups by paper with the best score, max limit', () => {
     const many = Array.from({ length: 40 }, (_, i) => hit(`p${i}`, i / 100));
-    expect(topPapers(many)).toHaveLength(30);
-    expect(topPapers([hit('a', 0.5), hit('a', 0.9), hit('b', 0.7)])).toEqual([
+    expect(topPapers(many, 5)).toHaveLength(5);
+    expect(topPapers(many, 5)[0]).toEqual({ paper_id: 'p39', score: 0.39 });
+    expect(
+      topPapers([hit('a', 0.5), hit('a', 0.9), hit('b', 0.7)], 5),
+    ).toEqual([
       { paper_id: 'a', score: 0.9 },
       { paper_id: 'b', score: 0.7 },
     ]);
